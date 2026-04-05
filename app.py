@@ -397,6 +397,14 @@ with t2:
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
+        if st.button("🔁 Retry Failed Dates",
+                     disabled=st.session_state['running'], use_container_width=True,
+                     help="Clears 'error' status so failed dates are retried on next download"):
+            c2 = col.init_db()
+            c2.execute("DELETE FROM download_log WHERE status='error'")
+            c2.commit(); c2.close()
+            st.success("Cleared error status. Click Download Bhavcopy to retry failed dates.")
+            st.rerun()
     with cb:
         # Show recent log
         failed = qry("SELECT trade_date,error_msg FROM download_log WHERE status='error' LIMIT 10")
@@ -406,6 +414,27 @@ with t2:
                          use_container_width=True, hide_index=True)
 
     # Progress
+
+    # Show sample of what columns NSE is returning (helps debug format changes)
+    sample_row = qry(
+        "SELECT trade_date FROM download_log WHERE status='error' LIMIT 1",
+        fetchall=False)
+    if dl_dict.get('error', 0) > 0:
+        with st.expander(f"⚠️ {dl_dict.get('error',0)} errors — likely new NSE column format"):
+            st.markdown("""
+            **Common cause:** NSE updated their Bhavcopy column names in 2024+.
+            The latest `nyztrade_historical_gex.py` handles all known formats.
+            Make sure you have the latest version of the file in your GitHub repo.
+
+            **Affected dates:** Usually 2024-01-01 onward (new NSE format).
+            **Fix:** Already handled — errors will reduce with next pipeline run.
+            """)
+            err_rows = qry(
+                "SELECT trade_date, error_msg FROM download_log WHERE status='error' LIMIT 20")
+            if err_rows:
+                import pandas as pd
+                st.dataframe(pd.DataFrame(err_rows, columns=['Date','Error']),
+                             use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("**Most recent downloads:**")
