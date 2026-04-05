@@ -1,6 +1,3 @@
-# NYZTrade Historical GEX Research Collector
-# Install: pip install -r requirements_research.txt
-
 pandas>=1.5.0
 numpy>=1.23.0
 scipy>=1.9.0
