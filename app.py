@@ -28,7 +28,6 @@ except Exception as e:
 import sqlite3
 import json
 import time
-import threading
 import pandas as pd
 from datetime import date, timedelta
 from pathlib import Path
@@ -128,46 +127,53 @@ st.markdown("""
 # ── Session state ────────────────────────────────────────────────────────────────
 for key, default in [
     ('running', False), ('prog', 0.0), ('prog_msg', ''),
-    ('error', ''), ('last_refresh', 0), ('thread_id', None),
+    ('error', ''), ('step_done', ''),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
-
-# Safety: if no thread is alive but running=True, reset it
-if st.session_state['running']:
-    tid = st.session_state.get('thread_id')
-    if tid is None:
-        st.session_state['running'] = False
 
 # ── DB connection — fresh per call (sqlite3 not thread-safe when shared) ──────────
 def fresh_conn():
     """Always return a fresh connection — avoids sqlite3.ProgrammingError across threads."""
     return col.init_db()
 
-# ── Progress callback (thread-safe via session state) ───────────────────────────
+# ── Synchronous runner with live UI updates ──────────────────────────────────────
+# Streamlit Cloud does not support persistent background threads.
+# We run synchronously and update the UI via placeholder widgets.
+
+_prog_bar = None   # set before running
+_prog_txt = None
+
 def prog_cb(pct, msg):
+    """Update progress bar and text in real time."""
     st.session_state['prog']     = float(pct)
     st.session_state['prog_msg'] = str(msg)
+    if _prog_bar is not None:
+        try:   _prog_bar.progress(float(pct), str(msg))
+        except Exception: pass
+    if _prog_txt is not None:
+        try:   _prog_txt.caption(f"⏳ {msg}")
+        except Exception: pass
 
-# ── Background runner ────────────────────────────────────────────────────────────
-def run_bg(fn, *args, **kwargs):
-    st.session_state['running']  = True
-    st.session_state['error']    = ''
-    st.session_state['prog']     = 0.0
-    st.session_state['prog_msg'] = 'Starting...'
-    def _target():
-        try:
-            c = col.init_db()
-            fn(c, *args, **kwargs)
-            c.close()
-        except Exception as e:
-            st.session_state['error'] = str(e)
-        finally:
-            st.session_state['running']  = False
-            st.session_state['thread_id'] = None
-    t = threading.Thread(target=_target, daemon=True)
-    st.session_state['thread_id'] = t.ident if hasattr(t,'ident') else id(t)
-    t.start()
+def run_sync(fn, prog_placeholder, txt_placeholder):
+    """Run fn(conn) synchronously, updating placeholders in real time."""
+    global _prog_bar, _prog_txt
+    _prog_bar = prog_placeholder
+    _prog_txt = txt_placeholder
+    st.session_state['running'] = True
+    st.session_state['error']   = ''
+    try:
+        c = col.init_db()
+        fn(c)
+        c.close()
+        st.session_state['step_done'] = '✅ Done!'
+    except Exception as e:
+        import traceback
+        st.session_state['error'] = f"{e}\n{traceback.format_exc()}"
+    finally:
+        st.session_state['running'] = False
+        _prog_bar = None
+        _prog_txt = None
 
 # ── Quick DB stats — fresh connection, full try/except ────────────────────────────
 def stats():
@@ -271,22 +277,16 @@ st.caption(
     "GEX / VANNA / Cascade pipeline (identical to the live dashboard) over 5+ years."
 )
 
-# Live progress bar — only shown when pipeline is actually running
-if st.session_state['running']:
-    pct = st.session_state.get('prog', 0.0)
-    msg = st.session_state.get('prog_msg', 'Running...')
-    st.progress(float(pct), f"⏳ {msg}")
-    col_inf, col_stp = st.columns([5, 1])
-    col_inf.info("Pipeline running — tabs update automatically every 3 seconds.")
-    if col_stp.button("⏹ Stop Now"):
-        st.session_state['running']   = False
-        st.session_state['thread_id'] = None
-        st.rerun()
-    time.sleep(3)
-    st.rerun()
+# Persistent placeholders for progress (updated live during sync run)
+_header_prog = st.empty()
+_header_txt  = st.empty()
+
+if st.session_state.get('step_done'):
+    st.success(st.session_state['step_done'])
+    st.session_state['step_done'] = ''
 
 if st.session_state.get('error'):
-    st.error(f"❌ Error: {st.session_state['error']}")
+    st.error(f"❌ {st.session_state['error'][:500]}")
     if st.button("Clear error"):
         st.session_state['error'] = ''
         st.rerun()
@@ -365,7 +365,7 @@ with t1:
             col.GEXEngine(c).compute_all(prog_cb)
             col.compute_returns(c, prog_cb)
             col.export_all(c, prog_cb)
-        run_bg(_all)
+        run_sync(_all, _header_prog, _header_txt)
         st.rerun()
 
     st.caption("💡 **Tip:** Start before sleeping. Typical run time: 3–4 hours for 7 years of data.")
@@ -394,7 +394,8 @@ with t2:
     with ca:
         if st.button("📥 Download Bhavcopy", type="primary",
                      disabled=st.session_state['running'], use_container_width=True):
-            run_bg(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb))
+            _p = st.empty(); _t = st.empty()
+            run_sync(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
     with cb:
         # Show recent log
@@ -405,8 +406,6 @@ with t2:
                          use_container_width=True, hide_index=True)
 
     # Progress
-    if st.session_state['running']:
-        st.progress(st.session_state['prog'], st.session_state['prog_msg'])
 
     st.divider()
     st.markdown("**Most recent downloads:**")
@@ -442,16 +441,16 @@ with t3:
     with ca:
         if st.button("📥 Download OHLCV", type="primary",
                      disabled=st.session_state['running'], use_container_width=True):
-            run_bg(lambda c: col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb))
+            _p = st.empty(); _t = st.empty()
+            run_sync(lambda c: col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
     with cb:
         if st.button("📐 Compute Returns from OHLCV",
                      disabled=st.session_state['running'], use_container_width=True):
-            run_bg(lambda c: col.compute_returns(c, prog_cb))
+            _p = st.empty(); _t = st.empty()
+            run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
             st.rerun()
 
-    if st.session_state['running']:
-        st.progress(st.session_state['prog'], st.session_state['prog_msg'])
 
     # Preview
     st.divider()
@@ -499,12 +498,14 @@ with t4:
     with ca:
         if st.button("⚙️ Compute GEX (pending only)", type="primary",
                      disabled=st.session_state['running'], use_container_width=True):
-            run_bg(lambda c: col.GEXEngine(c).compute_all(prog_cb))
+            _p = st.empty(); _t = st.empty()
+            run_sync(lambda c: col.GEXEngine(c).compute_all(prog_cb), _p, _t)
             st.rerun()
     with cb:
         if st.button("📐 Step 4: Compute Returns",
                      disabled=st.session_state['running'], use_container_width=True):
-            run_bg(lambda c: col.compute_returns(c, prog_cb))
+            _p = st.empty(); _t = st.empty()
+            run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
             st.rerun()
 
     if st.session_state['running']:
@@ -561,7 +562,8 @@ with t5:
 
     if st.button("📤 Generate All Export Files", type="primary",
                  disabled=st.session_state['running'], use_container_width=False):
-        run_bg(lambda c: col.export_all(c, prog_cb))
+        _p = st.empty(); _t = st.empty()
+        run_sync(lambda c: col.export_all(c, prog_cb), _p, _t)
         st.rerun()
 
     if st.session_state['running']:
