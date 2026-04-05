@@ -315,25 +315,90 @@ class BhavCopyDownloader:
         return None
 
     def _norm(self,df):
+        # Normalise columns — NSE has changed format 3 times since 2019
         df.columns=[c.strip().upper().replace(' ','_') for c in df.columns]
-        AL={'SYM':['SYMBOL','TRADINGSYMBOL'],'EXP':['EXPIRY_DT','EXPIRYDATE','EXPIRY_DATE'],
-            'OPT':['OPTION_TYP','OPTIONTYPE','OPTION_TYPE'],'STK':['STRIKE_PR','STRIKEPRICE','STRIKE_PRICE'],
-            'OI':['OPEN_INT','OPENINTEREST','OPEN_INTEREST','OI'],'OIC':['CHG_IN_OI','CHANGE_OI','OI_CHANGE'],
-            'LTP':['LAST','LTP','CLOSE'],'SET':['SETTLE_PR','SETTLEMENT_PRICE'],
-            'CTR':['CONTRACTS','NO_OF_CONTRACTS'],'UND':['UNDERLYING_VALUE','UNDERLYING']}
+
+        # Debug: log column names when normalisation fails (helps catch new formats)
+        AL={
+            # Symbol — all known variants across all NSE formats
+            'SYM': ['SYMBOL','TRADINGSYMBOL','SCRIPCODE','FININSTRMTDTLS',
+                    'INSTRUMENT','INSTRUMENTNAME'],
+            # Expiry date
+            'EXP': ['EXPIRY_DT','EXPIRYDATE','EXPIRY_DATE','EXPIRY',
+                    'XPRY_DT','EXPRYDT'],
+            # Option type CE/PE
+            'OPT': ['OPTION_TYP','OPTIONTYPE','OPTION_TYPE','OPT_TYPE',
+                    'OPTTYPE','OPTSTYLE','CALL_PUT'],
+            # Strike price
+            'STK': ['STRIKE_PR','STRIKEPRICE','STRIKE_PRICE','STRIKE',
+                    'STRK_PRC','EXRCPRIC','STRKPRIC'],
+            # Open interest
+            'OI':  ['OPEN_INT','OPENINTEREST','OPEN_INTEREST','OI',
+                    'OPEN_INT_','OPNINT','VAL_INLAKH'],
+            # OI change
+            'OIC': ['CHG_IN_OI','CHANGE_OI','OI_CHANGE','CHNG_IN_OI',
+                    'CHANGE_IN_OI','CHGOI','NET_CHGOI'],
+            # Last traded price
+            'LTP': ['LAST','LTP','CLOSE','LAST_PRICE','LASTPRICE',
+                    'CLOSE_PRICE','CLSPRIC','TRADPRC'],
+            # Settlement price
+            'SET': ['SETTLE_PR','SETTLEMENT_PRICE','SETTLEPRICE','SETTLE_PRICE',
+                    'STTLPRC','FINALPRIC'],
+            # Number of contracts
+            'CTR': ['CONTRACTS','NO_OF_CONTRACTS','VOLUME','QTY',
+                    'TRADEDQTY','TTLTTRDQTNTY'],
+            # Underlying index value (spot price)
+            'UND': ['UNDERLYING_VALUE','UNDERLYING','UNDL_VAL','UNDLYING',
+                    'UNDRLYNG','UNDERLYING_CLOSE','CLOSE_PRICE_UNDERLYING'],
+        }
         def fc(ks):
             for k in ks:
                 if k in df.columns: return k
             return None
         c={k:fc(v) for k,v in AL.items()}
-        if not all(c[k] for k in ['SYM','EXP','OPT','STK','OI']): return None
+
+        # If still missing required columns, try case-insensitive partial match
+        required = ['SYM','EXP','OPT','STK','OI']
+        missing  = [k for k in required if not c[k]]
+        if missing:
+            col_upper = {col.upper(): col for col in df.columns}
+            partial_map = {
+                'SYM': ['SYMBOL','SCRIPT','SCRIP'],
+                'EXP': ['EXPIR','EXPRY'],
+                'OPT': ['OPTION','OPTTYP','CALLPUT'],
+                'STK': ['STRIKE','STRK'],
+                'OI':  ['OPENINT','OPEN_INT','OPENIN'],
+            }
+            for k in missing:
+                for partial in partial_map.get(k, []):
+                    for orig_upper, orig in col_upper.items():
+                        if partial in orig_upper:
+                            c[k] = orig; break
+                    if c[k]: break
+
+        if not all(c[k] for k in required):
+            log.warning(f"  Column fail. Available: {list(df.columns[:15])}")
+            return None
+
         def sa(col,d=0):
-            return pd.to_numeric(df[col],errors='coerce').fillna(d) if col and col in df.columns else pd.Series([d]*len(df))
-        return pd.DataFrame({'symbol':df[c['SYM']].astype(str).str.strip(),
-            'expiry':df[c['EXP']].astype(str).str.strip(),'opttype':df[c['OPT']].astype(str).str.strip(),
-            'strike':pd.to_numeric(df[c['STK']],errors='coerce'),'oi':sa(c['OI']),
-            'oi_chg':sa(c['OIC']),'ltp':sa(c['LTP']),'settle':sa(c['SET']),
-            'contracts':sa(c['CTR']),'underlying':sa(c['UND'])})
+            if col and col in df.columns:
+                return pd.to_numeric(df[col].astype(str).str.replace(',',''),
+                                     errors='coerce').fillna(d)
+            return pd.Series([d]*len(df))
+
+        return pd.DataFrame({
+            'symbol':     df[c['SYM']].astype(str).str.strip(),
+            'expiry':     df[c['EXP']].astype(str).str.strip(),
+            'opttype':    df[c['OPT']].astype(str).str.strip().str.upper().str[:2],
+            'strike':     pd.to_numeric(df[c['STK']].astype(str).str.replace(',',''),
+                                         errors='coerce'),
+            'oi':         sa(c['OI']),
+            'oi_chg':     sa(c['OIC']),
+            'ltp':        sa(c['LTP']),
+            'settle':     sa(c['SET']),
+            'contracts':  sa(c['CTR']),
+            'underlying': sa(c['UND']),
+        })
 
     def download_range(self,start,end,progress_cb=None):
         cur=start; total=(end-start).days+1; done=0
