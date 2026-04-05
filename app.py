@@ -128,10 +128,16 @@ st.markdown("""
 # ── Session state ────────────────────────────────────────────────────────────────
 for key, default in [
     ('running', False), ('prog', 0.0), ('prog_msg', ''),
-    ('error', ''), ('last_refresh', 0),
+    ('error', ''), ('last_refresh', 0), ('thread_id', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Safety: if no thread is alive but running=True, reset it
+if st.session_state['running']:
+    tid = st.session_state.get('thread_id')
+    if tid is None:
+        st.session_state['running'] = False
 
 # ── DB connection — fresh per call (sqlite3 not thread-safe when shared) ──────────
 def fresh_conn():
@@ -145,8 +151,10 @@ def prog_cb(pct, msg):
 
 # ── Background runner ────────────────────────────────────────────────────────────
 def run_bg(fn, *args, **kwargs):
-    st.session_state['running'] = True
-    st.session_state['error']   = ''
+    st.session_state['running']  = True
+    st.session_state['error']    = ''
+    st.session_state['prog']     = 0.0
+    st.session_state['prog_msg'] = 'Starting...'
     def _target():
         try:
             c = col.init_db()
@@ -155,8 +163,11 @@ def run_bg(fn, *args, **kwargs):
         except Exception as e:
             st.session_state['error'] = str(e)
         finally:
-            st.session_state['running'] = False
-    threading.Thread(target=_target, daemon=True).start()
+            st.session_state['running']  = False
+            st.session_state['thread_id'] = None
+    t = threading.Thread(target=_target, daemon=True)
+    st.session_state['thread_id'] = t.ident if hasattr(t,'ident') else id(t)
+    t.start()
 
 # ── Quick DB stats — fresh connection, full try/except ────────────────────────────
 def stats():
@@ -220,8 +231,16 @@ with st.sidebar:
 
     st.markdown("**📅 Date Range**")
     c1, c2 = st.columns(2)
-    with c1: start_d = st.date_input("From", date(2019, 1, 1), key='start')
-    with c2: end_d   = st.date_input("To",   date.today(),    key='end')
+    with c1: start_d = st.date_input("From",
+                           value=date(2019, 1, 1),
+                           min_value=date(2010, 1, 1),
+                           max_value=date.today(),
+                           key='start')
+    with c2: end_d   = st.date_input("To",
+                           value=date.today(),
+                           min_value=date(2010, 1, 1),
+                           max_value=date.today(),
+                           key='end')
 
     st.markdown("**📌 Indices**")
     sel_syms = st.multiselect("", col.SYMBOLS, default=col.SYMBOLS)
@@ -252,14 +271,25 @@ st.caption(
     "GEX / VANNA / Cascade pipeline (identical to the live dashboard) over 5+ years."
 )
 
-# Live progress bar (always visible when running)
+# Live progress bar — only shown when pipeline is actually running
 if st.session_state['running']:
-    st.progress(st.session_state['prog'], st.session_state['prog_msg'])
-    st.info("⏳ Running... page auto-refreshes every 3 seconds.")
-    time.sleep(3); st.rerun()
+    pct = st.session_state.get('prog', 0.0)
+    msg = st.session_state.get('prog_msg', 'Running...')
+    st.progress(float(pct), f"⏳ {msg}")
+    col_inf, col_stp = st.columns([5, 1])
+    col_inf.info("Pipeline running — tabs update automatically every 3 seconds.")
+    if col_stp.button("⏹ Stop Now"):
+        st.session_state['running']   = False
+        st.session_state['thread_id'] = None
+        st.rerun()
+    time.sleep(3)
+    st.rerun()
 
-if st.session_state['error']:
-    st.error(f"❌ {st.session_state['error']}")
+if st.session_state.get('error'):
+    st.error(f"❌ Error: {st.session_state['error']}")
+    if st.button("Clear error"):
+        st.session_state['error'] = ''
+        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -286,6 +316,14 @@ with t1:
         s = stats()
     except Exception:
         s = {'bhavcopy_raw':0,'index_ohlcv':0,'gex_daily_summary':0,'pending':0}
+
+    # Welcome message when DB is empty
+    if s['bhavcopy_raw'] == 0 and not st.session_state['running']:
+        st.success(
+            "✅ **App is ready!** Click **Run Full Pipeline** below to start collecting "
+            "5 years of NSE Bhavcopy options data + Index OHLCV. "
+            "First run takes 3–6 hours. Safe to stop and resume anytime."
+        )
 
     # Stats row
     st.markdown('<div class="stat-row">', unsafe_allow_html=True)
@@ -318,24 +356,17 @@ with t1:
             unsafe_allow_html=True)
 
     st.divider()
-    ca, cb = st.columns([3, 1])
-    with ca:
-        if st.button("🚀 Run Full Pipeline", type="primary",
-                     disabled=st.session_state['running'],
-                     use_container_width=True):
-            def _all(c):
-                col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb)
-                col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb)
-                col.GEXEngine(c).compute_all(prog_cb)
-                col.compute_returns(c, prog_cb)
-                col.export_all(c, prog_cb)
-            run_bg(_all)
-            st.rerun()
-    with cb:
-        if st.button("⏹ Stop", disabled=not st.session_state['running'],
-                     use_container_width=True):
-            st.session_state['running'] = False
-            st.success("Stop requested. Current row will finish — all data already collected is safe.")
+    if st.button("🚀 Run Full Pipeline", type="primary",
+                 disabled=st.session_state['running'],
+                 use_container_width=True):
+        def _all(c):
+            col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb)
+            col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb)
+            col.GEXEngine(c).compute_all(prog_cb)
+            col.compute_returns(c, prog_cb)
+            col.export_all(c, prog_cb)
+        run_bg(_all)
+        st.rerun()
 
     st.caption("💡 **Tip:** Start before sleeping. Typical run time: 3–4 hours for 7 years of data.")
 
