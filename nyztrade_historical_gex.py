@@ -314,84 +314,106 @@ class BhavCopyDownloader:
             except Exception as e: log.debug(f"  {url}: {e}")
         return None
 
-    def _norm(self,df):
-        # Normalise columns — NSE has changed format 3 times since 2019
-        df.columns=[c.strip().upper().replace(' ','_') for c in df.columns]
+    def _norm(self, df):
+        """
+        Normalise Bhavcopy columns across ALL NSE format versions:
+          Format A (2019-2021): SYMBOL, EXPIRY_DT, OPTION_TYP, STRIKE_PR ...
+          Format B (2022-2023): Symbol, ExpiryDate, OptionType, StrikePrice ...
+          Format C (2024+):     TckrSymb, XpryDt, OptnTp, StrkPric ...
+        """
+        # Store original columns for fallback matching
+        original_cols = list(df.columns)
 
-        # Debug: log column names when normalisation fails (helps catch new formats)
-        AL={
-            # Symbol — all known variants across all NSE formats
-            'SYM': ['SYMBOL','TRADINGSYMBOL','SCRIPCODE','FININSTRMTDTLS',
-                    'INSTRUMENT','INSTRUMENTNAME'],
+        # Uppercase + strip for matching (but keep original df intact)
+        upper_map = {c.strip().upper().replace(' ', '_'): c for c in df.columns}
+        df.columns = [c.strip().upper().replace(' ', '_') for c in df.columns]
+
+        AL = {
+            # Symbol / Ticker
+            'SYM': ['TCKRSYMB',           # 2024+ new format
+                    'SYMBOL', 'TRADINGSYMBOL', 'SCRIPCODE',
+                    'FININSTRMID', 'INSTRUMENT', 'INSTRUMENTNAME'],
             # Expiry date
-            'EXP': ['EXPIRY_DT','EXPIRYDATE','EXPIRY_DATE','EXPIRY',
-                    'XPRY_DT','EXPRYDT'],
+            'EXP': ['XPRYDT',             # 2024+ new format
+                    'EXPIRY_DT', 'EXPIRYDATE', 'EXPIRY_DATE', 'EXPIRY',
+                    'XPRY_DT', 'EXPRYDT', 'FININSTRMACTLXPRYDT'],
             # Option type CE/PE
-            'OPT': ['OPTION_TYP','OPTIONTYPE','OPTION_TYPE','OPT_TYPE',
-                    'OPTTYPE','OPTSTYLE','CALL_PUT'],
+            'OPT': ['OPTNTP',             # 2024+ new format
+                    'OPTION_TYP', 'OPTIONTYPE', 'OPTION_TYPE', 'OPT_TYPE',
+                    'OPTTYPE', 'OPTSTYLE', 'CALL_PUT'],
             # Strike price
-            'STK': ['STRIKE_PR','STRIKEPRICE','STRIKE_PRICE','STRIKE',
-                    'STRK_PRC','EXRCPRIC','STRKPRIC'],
+            'STK': ['STRKPRIC',           # 2024+ new format
+                    'STRIKE_PR', 'STRIKEPRICE', 'STRIKE_PRICE', 'STRIKE',
+                    'STRK_PRC', 'EXRCPRIC'],
             # Open interest
-            'OI':  ['OPEN_INT','OPENINTEREST','OPEN_INTEREST','OI',
-                    'OPEN_INT_','OPNINT','VAL_INLAKH'],
+            'OI':  ['OPNINTRST',          # 2024+ new format
+                    'OPEN_INT', 'OPENINTEREST', 'OPEN_INTEREST', 'OI',
+                    'OPEN_INT_', 'OPNINT'],
             # OI change
-            'OIC': ['CHG_IN_OI','CHANGE_OI','OI_CHANGE','CHNG_IN_OI',
-                    'CHANGE_IN_OI','CHGOI','NET_CHGOI'],
+            'OIC': ['CHNGINOPNINTRST',    # 2024+ new format
+                    'CHG_IN_OI', 'CHANGE_OI', 'OI_CHANGE', 'CHNG_IN_OI',
+                    'CHANGE_IN_OI', 'CHGOI'],
             # Last traded price
-            'LTP': ['LAST','LTP','CLOSE','LAST_PRICE','LASTPRICE',
-                    'CLOSE_PRICE','CLSPRIC','TRADPRC'],
+            'LTP': ['LASTPRIC',           # 2024+ new format
+                    'LAST', 'LTP', 'CLOSE', 'LAST_PRICE', 'LASTPRICE',
+                    'CLOSE_PRICE', 'CLSPRIC', 'TRADPRC'],
             # Settlement price
-            'SET': ['SETTLE_PR','SETTLEMENT_PRICE','SETTLEPRICE','SETTLE_PRICE',
-                    'STTLPRC','FINALPRIC'],
-            # Number of contracts
-            'CTR': ['CONTRACTS','NO_OF_CONTRACTS','VOLUME','QTY',
-                    'TRADEDQTY','TTLTTRDQTNTY'],
-            # Underlying index value (spot price)
-            'UND': ['UNDERLYING_VALUE','UNDERLYING','UNDL_VAL','UNDLYING',
-                    'UNDRLYNG','UNDERLYING_CLOSE','CLOSE_PRICE_UNDERLYING'],
+            'SET': ['STTLMPRIC',          # 2024+ new format
+                    'SETTLE_PR', 'SETTLEMENT_PRICE', 'SETTLEPRICE',
+                    'SETTLE_PRICE', 'STTLPRC', 'FINALPRIC'],
+            # Number of contracts / volume
+            'CTR': ['TTLTRDQTY',          # 2024+ new format
+                    'CONTRACTS', 'NO_OF_CONTRACTS', 'VOLUME', 'QTY',
+                    'TRADEDQTY', 'TTLTTRDQTNTY', 'TTLTRDVAL'],
+            # Underlying price (spot)
+            'UND': ['UNDRLYG_PRC',        # variant
+                    'UNDRLYGPRIC',        # 2024+ new format
+                    'UNDERLYING_VALUE', 'UNDERLYING', 'UNDL_VAL',
+                    'UNDLYING', 'UNDRLYNG', 'UNDERLYING_CLOSE'],
         }
-        def fc(ks):
-            for k in ks:
-                if k in df.columns: return k
-            return None
-        c={k:fc(v) for k,v in AL.items()}
 
-        # If still missing required columns, try case-insensitive partial match
-        required = ['SYM','EXP','OPT','STK','OI']
-        missing  = [k for k in required if not c[k]]
-        if missing:
-            col_upper = {col.upper(): col for col in df.columns}
-            partial_map = {
-                'SYM': ['SYMBOL','SCRIPT','SCRIP'],
-                'EXP': ['EXPIR','EXPRY'],
-                'OPT': ['OPTION','OPTTYP','CALLPUT'],
-                'STK': ['STRIKE','STRK'],
-                'OI':  ['OPENINT','OPEN_INT','OPENIN'],
+        def fc(keys):
+            for k in keys:
+                if k in df.columns:
+                    return k
+            return None
+
+        c = {k: fc(v) for k, v in AL.items()}
+
+        # Fallback: partial match on uppercased column names
+        if not all(c[k] for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']):
+            partial = {
+                'SYM': ['TCKR', 'SYMBOL', 'SCRIP'],
+                'EXP': ['XPRY', 'EXPIR'],
+                'OPT': ['OPTN', 'OPTION', 'CALLPUT'],
+                'STK': ['STRK', 'STRIKE'],
+                'OI':  ['OPNINT', 'OPENINT', 'OPEN_INT'],
             }
-            for k in missing:
-                for partial in partial_map.get(k, []):
-                    for orig_upper, orig in col_upper.items():
-                        if partial in orig_upper:
-                            c[k] = orig; break
-                    if c[k]: break
+            for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']:
+                if not c[k]:
+                    for part in partial.get(k, []):
+                        for col in df.columns:
+                            if part in col:
+                                c[k] = col
+                                break
+                        if c[k]:
+                            break
 
-        if not all(c[k] for k in required):
-            log.warning(f"  Column fail. Available: {list(df.columns[:15])}")
+        if not all(c[k] for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']):
+            log.warning(f"col fail — cols: {list(df.columns[:20])}")
             return None
 
-        def sa(col,d=0):
+        def sa(col, d=0):
             if col and col in df.columns:
-                return pd.to_numeric(df[col].astype(str).str.replace(',',''),
-                                     errors='coerce').fillna(d)
-            return pd.Series([d]*len(df))
+                s = df[col].astype(str).str.replace(',', '', regex=False)
+                return pd.to_numeric(s, errors='coerce').fillna(d)
+            return pd.Series([d] * len(df))
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             'symbol':     df[c['SYM']].astype(str).str.strip(),
             'expiry':     df[c['EXP']].astype(str).str.strip(),
             'opttype':    df[c['OPT']].astype(str).str.strip().str.upper().str[:2],
-            'strike':     pd.to_numeric(df[c['STK']].astype(str).str.replace(',',''),
-                                         errors='coerce'),
+            'strike':     sa(c['STK']),
             'oi':         sa(c['OI']),
             'oi_chg':     sa(c['OIC']),
             'ltp':        sa(c['LTP']),
@@ -399,6 +421,7 @@ class BhavCopyDownloader:
             'contracts':  sa(c['CTR']),
             'underlying': sa(c['UND']),
         })
+        return result
 
     def download_range(self,start,end,progress_cb=None):
         cur=start; total=(end-start).days+1; done=0
