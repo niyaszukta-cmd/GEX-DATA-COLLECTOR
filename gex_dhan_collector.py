@@ -111,19 +111,17 @@ def init_db() -> sqlite3.Connection:
 
     -- Per-strike options data fetched from Dhan
     CREATE TABLE IF NOT EXISTS options_raw (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_date  TEXT NOT NULL,
-        strike      REAL NOT NULL,
-        option_type TEXT NOT NULL,   -- CE or PE
-        open        REAL DEFAULT 0,
-        high        REAL DEFAULT 0,
-        low         REAL DEFAULT 0,
-        close       REAL DEFAULT 0,  -- LTP / settlement
-        volume      REAL DEFAULT 0,
+        trade_date    TEXT NOT NULL,
+        expiry_date   TEXT NOT NULL,
+        strike        REAL NOT NULL,
+        option_type   TEXT NOT NULL,
+        ltp           REAL DEFAULT 0,
+        volume        REAL DEFAULT 0,
         open_interest REAL DEFAULT 0,
-        spot_price  REAL DEFAULT 0,
-        UNIQUE(trade_date, strike, option_type)
+        spot_price    REAL DEFAULT 0,
+        PRIMARY KEY(trade_date, expiry_date, strike, option_type)
     );
+    CREATE INDEX IF NOT EXISTS idx_opt_date ON options_raw(trade_date);
 
     -- Computed GEX per strike per day
     CREATE TABLE IF NOT EXISTS gex_per_strike (
@@ -164,12 +162,19 @@ def init_db() -> sqlite3.Connection:
         n_strikes           INTEGER
     );
 
-    -- Download progress tracker
+    -- Track which expiries have been fully fetched
+    CREATE TABLE IF NOT EXISTS expiry_log (
+        expiry_date TEXT PRIMARY KEY,
+        status      TEXT,
+        n_contracts INTEGER DEFAULT 0,
+        n_days      INTEGER DEFAULT 0
+    );
+    -- Keep fetch_log for compatibility
     CREATE TABLE IF NOT EXISTS fetch_log (
         trade_date  TEXT NOT NULL,
         strike      REAL NOT NULL,
         option_type TEXT NOT NULL,
-        status      TEXT,           -- ok / error / no_data
+        status      TEXT,
         error_msg   TEXT,
         PRIMARY KEY(trade_date, strike, option_type)
     );
@@ -328,36 +333,23 @@ class DhanClient:
                 continue
         return rows
 
-    def search_option_security_id(self, strike: float,
-                                   expiry_date: str,
-                                   option_type: str) -> Optional[str]:
-        """
-        Find the Dhan security_id for a specific NIFTY option contract.
-        Uses Dhan's option chain search endpoint.
-        expiry_date: 'YYYY-MM-DD'
-        option_type: 'CE' or 'PE'
-        """
+    def get_option_chain(self, expiry_date: str) -> list:
+        """Get full option chain for NIFTY on given expiry — returns all strikes+securityIds."""
         try:
-            r = requests.get(
-                f'{DHAN_BASE}/v2/optionchain',
+            r = requests.get(f'{DHAN_BASE}/v2/optionchain',
                 headers=self.headers,
-                params={
-                    'UnderlyingScrip': 'NIFTY',
-                    'UnderlyingSeg':   'IDX_I',
-                    'Expiry':          expiry_date,
-                },
-                timeout=15)
-            if r.status_code != 200:
-                return None
-            chain = r.json().get('data', [])
-            for item in chain:
-                if abs(float(item.get('strikePrice', 0)) - strike) < 1:
-                    side = item.get('callOption' if option_type == 'CE' else 'putOption', {})
-                    if side:
-                        return str(side.get('securityId', ''))
+                params={'UnderlyingScrip':'NIFTY','UnderlyingSeg':'IDX_I','Expiry':expiry_date},
+                timeout=20)
+            if r.status_code == 200:
+                return r.json().get('data', [])
         except Exception as e:
-            log.debug(f"Security ID search error: {e}")
-        return None
+            log.debug(f"Option chain error: {e}")
+        return []
+
+    def get_option_candles(self, security_id: str, from_date: str, to_date: str) -> list:
+        """Fetch full daily history for ONE contract in ONE request."""
+        data = self.get_option_ohlcv(security_id, from_date, to_date)
+        return data
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -366,9 +358,26 @@ class DhanClient:
 def get_next_thursday(from_date: date) -> date:
     """Get the next/current Thursday (NSE weekly expiry day)."""
     d = from_date
-    while d.weekday() != 3:  # 3 = Thursday
+    while d.weekday() != 3:
         d += timedelta(days=1)
     return d
+
+def all_thursdays(start: date, end: date):
+    """All Thursdays in range — one per weekly expiry."""
+    thursdays = []
+    d = start
+    while d.weekday() != 3:
+        d += timedelta(days=1)
+    while d <= end:
+        thursdays.append(d)
+        d += timedelta(days=7)
+    return thursdays
+
+def spot_on_date(conn, date_str: str) -> float:
+    row = conn.execute(
+        "SELECT close FROM nifty_ohlcv WHERE trade_date=? LIMIT 1",
+        (date_str,)).fetchone()
+    return float(row[0]) if row and row[0] else 0.0
 
 def get_monthly_expiry(from_date: date) -> date:
     """Last Thursday of the month."""
@@ -439,108 +448,115 @@ class GEXCollector:
         return total_rows
 
     # ── Step 2: Fetch option data for all strikes ─────────────────────────────
-    def fetch_options_data(self, start: date, end: date,
-                            progress_cb=None):
+    def fetch_options_data(self, start: date, end: date, progress_cb=None):
         """
-        For each trading day:
-          1. Get NIFTY close → compute ATM
-          2. Build strike list (ATM ± 15)
-          3. Find nearest weekly expiry
-          4. Fetch Dhan historical OHLCV+OI for each strike CE+PE
+        CORRECT APPROACH — expiry-first (not day-by-day):
+          For each weekly Thursday expiry in the range:
+            1. GET option chain → all strike security IDs
+            2. Filter to ATM±15 strikes
+            3. Fetch full candle history per contract in ONE Dhan call
+            4. Store all daily rows
+        This avoids the "31 Dec only" bug from single-day fetching.
         """
-        # Get all trading days where we have NIFTY prices
-        trading_days = self.conn.execute("""
-            SELECT trade_date, close FROM nifty_ohlcv
-            WHERE trade_date >= ? AND trade_date <= ?
-            ORDER BY trade_date
-        """, (start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))).fetchall()
+        expiries = all_thursdays(start, end)
+        total    = len(expiries)
+        log.info(f"Processing {total} weekly expiries...")
 
-        total = len(trading_days)
-        log.info(f"Fetching options for {total} trading days...")
-
-        # Pre-build expiry→security_id cache to reduce API calls
-        sec_id_cache = {}  # (strike, expiry, otype) → security_id
-
-        for day_idx, (date_str, spot) in enumerate(trading_days):
-            if progress_cb:
-                progress_cb(day_idx / total,
-                            f"Options {date_str} (ATM={atm_strike(spot):.0f})")
-
-            atm   = atm_strike(spot)
-            strikes = strike_range(atm)
-            trade_date = date.fromisoformat(date_str)
-            expiry = get_next_thursday(trade_date)
-
-            # If expiry is today, use next week's expiry
-            if expiry == trade_date:
-                expiry = get_next_thursday(trade_date + timedelta(days=1))
-
+        for exp_idx, expiry in enumerate(expiries):
             expiry_str = expiry.strftime('%Y-%m-%d')
 
-            for strike in strikes:
-                for otype in ['CE', 'PE']:
-                    # Check if already fetched
-                    existing = self.conn.execute("""
-                        SELECT status FROM fetch_log
-                        WHERE trade_date=? AND strike=? AND option_type=?
-                    """, (date_str, strike, otype)).fetchone()
-                    if existing and existing[0] == 'ok':
-                        continue
+            # Skip already done
+            done = self.conn.execute(
+                "SELECT status FROM expiry_log WHERE expiry_date=?",
+                (expiry_str,)).fetchone()
+            if done and done[0] == 'ok':
+                if progress_cb: progress_cb(exp_idx/total, f"Skip {expiry_str}")
+                continue
 
-                    # Get security ID
-                    cache_key = (strike, expiry_str, otype)
-                    sec_id = sec_id_cache.get(cache_key)
-                    if not sec_id:
-                        sec_id = self.client.search_option_security_id(
-                            strike, expiry_str, otype)
-                        if sec_id:
-                            sec_id_cache[cache_key] = sec_id
+            if progress_cb:
+                progress_cb(exp_idx/total, f"Expiry {expiry_str} ({exp_idx+1}/{total})")
+            log.info(f"[{exp_idx+1}/{total}] Expiry {expiry_str}")
 
-                    if not sec_id:
-                        self.conn.execute("""
-                            INSERT OR REPLACE INTO fetch_log
-                            (trade_date, strike, option_type, status, error_msg)
-                            VALUES (?,?,?,'error','no_security_id')
-                        """, (date_str, strike, otype))
-                        self.conn.commit()
-                        continue
+            # Get option chain — returns all strikes + security IDs
+            chain = self.client.get_option_chain(expiry_str)
+            if not chain:
+                log.warning(f"  No chain for {expiry_str}")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO expiry_log(expiry_date,status) VALUES(?,?)",
+                    (expiry_str,'error'))
+                self.conn.commit()
+                time.sleep(1); continue
 
-                    # Fetch OHLCV+OI for this specific contract
-                    # We only need the single day, but Dhan needs a range
-                    rows = self.client.get_option_ohlcv(
-                        sec_id,
-                        date_str,
-                        date_str)
+            # Determine ATM from NIFTY spot ~1 week before expiry
+            atm = None
+            for delta in range(8):
+                check = (expiry - timedelta(days=7-delta)).strftime('%Y-%m-%d')
+                sp = spot_on_date(self.conn, check)
+                if sp > 0:
+                    atm = atm_strike(sp); break
+            if atm is None:
+                # Fallback: median of chain strikes
+                all_s = sorted([float(x.get('strikePrice',0)) for x in chain if x.get('strikePrice')])
+                if all_s: atm = atm_strike(all_s[len(all_s)//2])
+            if atm is None:
+                log.warning(f"  Cannot determine ATM for {expiry_str}"); continue
 
-                    # Find the row matching our trade date
-                    day_row = next((r for r in rows if r['date'] == date_str), None)
+            targets = set(strike_range(atm))
+            log.info(f"  ATM={atm:.0f} → {len(targets)} target strikes")
 
-                    if day_row:
+            # Build security ID map from chain
+            sec_ids = {}
+            for item in chain:
+                try:
+                    strike = float(item.get('strikePrice', 0))
+                    if strike not in targets: continue
+                    ce = (item.get('callOption') or {})
+                    pe = (item.get('putOption')  or {})
+                    if ce.get('securityId'):
+                        sec_ids.setdefault(strike, {})['CE'] = str(ce['securityId'])
+                    if pe.get('securityId'):
+                        sec_ids.setdefault(strike, {})['PE'] = str(pe['securityId'])
+                except Exception:
+                    continue
+
+            log.info(f"  Found {len(sec_ids)} strikes in chain")
+
+            # Date range for this contract: up to 3 weeks before expiry
+            contract_from = max(start, expiry - timedelta(days=21))
+            contract_to   = min(end, expiry)
+            from_str = contract_from.strftime('%Y-%m-%d')
+            to_str   = contract_to.strftime('%Y-%m-%d')
+
+            # Fetch full history per contract in ONE call
+            n_stored = 0
+            for strike, sides in sec_ids.items():
+                for otype, sec_id in sides.items():
+                    rows = self.client.get_option_candles(sec_id, from_str, to_str)
+                    for row in rows:
+                        sp = spot_on_date(self.conn, row['date'])
                         self.conn.execute("""
                             INSERT OR REPLACE INTO options_raw
-                            (trade_date, strike, option_type,
-                             close, volume, open_interest, spot_price)
-                            VALUES (?,?,?,?,?,?,?)
-                        """, (date_str, strike, otype,
-                              day_row['close'], day_row['vol'],
-                              day_row['oi'], spot))
-                        self.conn.execute("""
-                            INSERT OR REPLACE INTO fetch_log
-                            (trade_date, strike, option_type, status)
-                            VALUES (?,?,?,'ok')
-                        """, (date_str, strike, otype))
-                    else:
-                        self.conn.execute("""
-                            INSERT OR REPLACE INTO fetch_log
-                            (trade_date, strike, option_type, status)
-                            VALUES (?,?,?,'no_data')
-                        """, (date_str, strike, otype))
-
+                            (trade_date, expiry_date, strike, option_type,
+                             ltp, volume, open_interest, spot_price)
+                            VALUES (?,?,?,?,?,?,?,?)
+                        """, (row['date'], expiry_str, strike, otype,
+                              row.get('close',0), row.get('vol',0),
+                              row.get('oi',0), sp))
+                        n_stored += 1
                     self.conn.commit()
-                    time.sleep(0.1)  # gentle rate limit
+                    time.sleep(0.15)
 
-            save_cp('last_options_date', date_str)
-            log.info(f"  [{day_idx+1}/{total}] {date_str} ATM={atm:.0f}")
+            log.info(f"  Stored {n_stored} rows for {expiry_str}")
+            self.conn.execute("""
+                INSERT OR REPLACE INTO expiry_log
+                (expiry_date, status, n_contracts, n_days)
+                VALUES(?,?,?,?)
+            """, (expiry_str, 'ok', len(sec_ids)*2, n_stored))
+            self.conn.commit()
+            save_cp('last_expiry', expiry_str)
+            time.sleep(0.5)
+
+        log.info("Options fetch complete.")
 
     # ── Step 3: Compute GEX ───────────────────────────────────────────────────
     def compute_gex(self, progress_cb=None):
@@ -577,17 +593,22 @@ class GEXCollector:
         """Compute GEX for one trading day."""
         # Get options data
         rows = self.conn.execute("""
-            SELECT strike, option_type, close, open_interest, spot_price
+            SELECT strike, option_type, ltp, open_interest, spot_price, expiry_date
             FROM options_raw
             WHERE trade_date = ? AND open_interest > 0
-            ORDER BY strike
+            ORDER BY expiry_date, strike
         """, (date_str,)).fetchall()
 
         if not rows:
             return
 
-        df = pd.DataFrame(rows, columns=['strike','otype','ltp','oi','spot'])
-        spot = float(df['spot'].iloc[0])
+        df = pd.DataFrame(rows, columns=['strike','otype','ltp','oi','spot','expiry'])
+        # Use nearest expiry
+        trade_date_obj = date.fromisoformat(date_str)
+        exp_dates = df['expiry'].unique()
+        nearest = min(exp_dates, key=lambda e: abs((date.fromisoformat(e)-trade_date_obj).days))
+        df = df[df['expiry']==nearest].copy()
+        spot = float(df['spot'].replace(0,np.nan).dropna().iloc[0]) if df['spot'].replace(0,np.nan).dropna().any() else 0
         if spot <= 0:
             # Try NIFTY OHLCV
             row = self.conn.execute(
