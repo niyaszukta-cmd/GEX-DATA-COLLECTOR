@@ -231,6 +231,61 @@ def qry(sql, params=(), fetchall=True):
     except Exception:
         return [] if fetchall else None
 
+
+# ── yfinance OHLCV downloader (works on Streamlit Cloud) ─────────────────────────
+def _download_ohlcv_yfinance(conn, start_d, end_d, prog_cb=None):
+    try:
+        import yfinance as yf
+    except ImportError:
+        if prog_cb: prog_cb(0, "Install yfinance: add to requirements.txt")
+        return
+
+    YF_MAP = {
+        "NIFTY":      "^NSEI",
+        "BANKNIFTY":  "^NSEBANK",
+        "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
+        "MIDCPNIFTY": "NIFTY_MIDCAP_SELECT.NS",
+    }
+    symbols = col.SYMBOLS
+    for i, sym in enumerate(symbols):
+        ticker = YF_MAP.get(sym)
+        if not ticker: continue
+        if prog_cb: prog_cb(i/len(symbols), f"Downloading {sym} OHLCV via Yahoo Finance...")
+        try:
+            df = yf.download(ticker,
+                             start=start_d.strftime("%Y-%m-%d"),
+                             end=end_d.strftime("%Y-%m-%d"),
+                             auto_adjust=True, progress=False)
+            if df.empty: continue
+            df = df.reset_index()
+            # Flatten MultiIndex columns if present
+            if hasattr(df.columns, "levels"):
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df.columns = [str(c).strip() for c in df.columns]
+            rows = []
+            for _, row in df.iterrows():
+                try:
+                    td  = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
+                    o   = float(row.get("Open",  0) or 0)
+                    h   = float(row.get("High",  0) or 0)
+                    l   = float(row.get("Low",   0) or 0)
+                    cl  = float(row.get("Close", 0) or 0)
+                    v   = float(row.get("Volume",0) or 0)
+                    chg = ((cl - o) / o * 100) if o > 0 else 0
+                    rows.append((td, sym, o, h, l, cl, v, round(chg, 4)))
+                except Exception:
+                    continue
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO index_ohlcv "
+                    "(trade_date,symbol,open,high,low,close,volume,change_pct) "
+                    "VALUES(?,?,?,?,?,?,?,?)", rows)
+                conn.commit()
+                if prog_cb: prog_cb((i+0.9)/len(symbols), f"{sym}: {len(rows)} rows saved")
+        except Exception as e:
+            if prog_cb: prog_cb(i/len(symbols), f"{sym} error: {e}")
+    if prog_cb: prog_cb(1.0, "OHLCV complete")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -496,11 +551,12 @@ with t3:
     st.divider()
     ca, cb = st.columns(2)
     with ca:
-        if st.button("📥 Download OHLCV", type="primary",
+        if st.button("📥 Download OHLCV (Yahoo Finance)", type="primary",
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
-            run_sync(lambda c: col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
-            st.session_state['step_done'] = '✅ OHLCV download complete! Stats updated below.'
+            def _yf_dl(c): _download_ohlcv_yfinance(c, start_d, end_d, prog_cb)
+            run_sync(_yf_dl, _p, _t)
+            st.session_state["step_done"] = "OHLCV download complete!"
     with cb:
         if st.button("📐 Compute Returns from OHLCV",
                      use_container_width=True):
