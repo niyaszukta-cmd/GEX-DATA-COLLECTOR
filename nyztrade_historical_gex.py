@@ -1,844 +1,821 @@
 """
-NYZTrade Historical GEX Research Processor
-==========================================
-Reuses the EXACT same analytics pipeline as the NYZTrade dashboard.
+NYZTrade Historical GEX Collector — Dhan API
+============================================
+Fetches NIFTY options data (ATM ± 15 strikes) from Dhan API
+and computes GEX, VANNA, DEX for each day.
 
-DATA COLLECTED:
-  1. NSE Bhavcopy options OI + LTP per strike (EOD) — 2019-present, FREE
-  2. NSE Index OHLCV (open/high/low/close/volume) — FREE
-
-SAFETY FEATURES:
-  - Every download cached to disk BEFORE DB insert (resume safely after crash)
-  - WAL journal mode: DB never corrupts on power-off / Ctrl-C
-  - Checkpoint JSON: tracks exact last processed item
-  - All DB writes use INSERT OR IGNORE / INSERT OR REPLACE (idempotent)
-  - Progress logged to nyztrade_gex_research.log (persistent)
-
-OUTPUTS (research_export/):
-  MASTER_DATASET.csv        <- GEX + OHLCV merged, one row/day/symbol
-  GEX_MAIN_DATASET.csv      <- GEX analytics only
-  OHLCV_ALL.csv             <- All index OHLCV
-  OHLCV_{SYMBOL}.csv        <- Per-symbol OHLCV
-  GEX_PER_STRIKE.csv        <- Strike-level cross-sectional data
-  GEX_{SYMBOL}.csv          <- Per-symbol GEX summary
+WHAT IT DOES:
+  1. Get NIFTY closing price from Dhan for each trading day
+  2. Find ATM strike (round to nearest 50)
+  3. Fetch daily OHLCV+OI for strikes ATM-15 to ATM+15 (CE + PE)
+  4. Compute Black-Scholes IV, Gamma, Vanna, Delta
+  5. Compute net GEX, VANNA, DEX per strike and daily aggregate
+  6. Save to SQLite + export to CSV
 
 USAGE:
-  python nyztrade_historical_gex.py --download   # Step 1: NSE Bhavcopy options
-  python nyztrade_historical_gex.py --ohlcv      # Step 2: Index OHLCV
-  python nyztrade_historical_gex.py --compute    # Step 3: GEX analytics
-  python nyztrade_historical_gex.py --returns    # Step 4: Return variables
-  python nyztrade_historical_gex.py --export     # Step 5: Export CSVs
-  python nyztrade_historical_gex.py --summary    # Check progress
-  python nyztrade_historical_gex.py --all        # Run all steps
+  Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit sidebar
+  then click Run.
+
+DHAN API ENDPOINTS USED:
+  POST /v2/charts/historical  → OHLCV + OI per option contract
+  POST /v2/charts/historical  → NIFTY index closing price
 """
 
-import os, sys, io, time, sqlite3, zipfile, json, logging, argparse
+import os, sys, io, time, sqlite3, json, logging, argparse
 import requests
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Optional, Tuple
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-# Safe logging — FileHandler may fail on read-only Cloud filesystem
-_log_handlers = [logging.StreamHandler(sys.stdout)]
+# ── Safe logging (works on Streamlit Cloud) ────────────────────────────────────
+_handlers = [logging.StreamHandler(sys.stdout)]
 try:
-    _log_handlers.insert(0, logging.FileHandler('nyztrade_gex_research.log'))
+    _handlers.insert(0, logging.FileHandler('gex_collector.log'))
 except Exception:
-    pass  # Can't write log file — stdout only
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=_log_handlers
-)
+    pass
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s [%(levelname)s] %(message)s',
+                    handlers=_handlers)
 log = logging.getLogger('NYZTrade')
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-# ── Work directory — safe on Streamlit Cloud (read-only filesystem) ──────────────
-def _safe_workdir():
-    """Find a writable directory. Current dir first, /tmp fallback."""
-    for base in [Path('.'), Path('/tmp/nyztrade_research')]:
+# ── Paths (safe on Streamlit Cloud read-only filesystem) ──────────────────────
+def _workdir():
+    for base in [Path('.'), Path('/tmp/nyztrade_gex')]:
         try:
             base.mkdir(parents=True, exist_ok=True)
-            test = base / '.write_test'
-            test.write_text('ok')
-            test.unlink()
+            t = base / '.test'; t.write_text('ok'); t.unlink()
             return base
         except Exception:
             continue
     return Path('/tmp')
 
-_WORK = _safe_workdir()
+WORK_DIR        = _workdir()
+DB_PATH         = WORK_DIR / 'gex_dhan.db'
+EXPORT_DIR      = WORK_DIR / 'export'
+CHECKPOINT_FILE = WORK_DIR / 'checkpoint.json'
+try:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
-DB_PATH         = _WORK / 'nyztrade_research.db'
-RAW_DIR         = _WORK / 'bhavcopy_cache'
-OHLCV_DIR       = _WORK / 'ohlcv_cache'
-EXPORT_DIR      = _WORK / 'research_export'
-CHECKPOINT_FILE = _WORK / 'nyztrade_checkpoint.json'
+# ── Config ────────────────────────────────────────────────────────────────────
+DHAN_BASE       = 'https://api.dhan.co'
+NIFTY_SEC_ID    = '13'          # Dhan security ID for NIFTY 50 index
+NIFTY_SEGMENT   = 'IDX_I'
+NIFTY_FO_SEG    = 'NSE_FO'
+STRIKE_INTERVAL = 50            # NIFTY strikes in multiples of 50
+ATM_RANGE       = 15            # ATM ± 15 strikes = 31 strikes total
+RISK_FREE       = 0.065         # 6.5% Indian T-bill
+LOT_SIZE        = 75            # NIFTY lot size (post-Nov 2024)
+UNIT_DIV        = 1e9           # Display in Billions
 
-# Safe mkdir — never crashes on import even on read-only filesystems
-for _d in [RAW_DIR, OHLCV_DIR, EXPORT_DIR]:
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+def save_cp(key, val):
+    cp = {}
     try:
-        _d.mkdir(parents=True, exist_ok=True)
+        if CHECKPOINT_FILE.exists():
+            cp = json.loads(CHECKPOINT_FILE.read_text())
+    except Exception:
+        pass
+    cp[key] = val
+    try:
+        CHECKPOINT_FILE.write_text(json.dumps(cp, indent=2))
     except Exception:
         pass
 
-# ── Symbols ────────────────────────────────────────────────────────────────────
-SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
-
-INDEX_CONFIG = {
-    'NIFTY':      {'lot_size': 50,  'unit_divisor': 1e9, 'unit_label': 'B',
-                   'total_cascade_pot': 500,  'nse_index': 'NIFTY 50'},
-    'BANKNIFTY':  {'lot_size': 15,  'unit_divisor': 1e9, 'unit_label': 'B',
-                   'total_cascade_pot': 1000, 'nse_index': 'NIFTY BANK'},
-    'FINNIFTY':   {'lot_size': 40,  'unit_divisor': 1e9, 'unit_label': 'B',
-                   'total_cascade_pot': 200,  'nse_index': 'NIFTY FIN SERVICE'},
-    'MIDCPNIFTY': {'lot_size': 75,  'unit_divisor': 1e9, 'unit_label': 'B',
-                   'total_cascade_pot': 300,  'nse_index': 'NIFTY MIDCAP SELECT'},
-}
-
-RISK_FREE_RATE = 0.065
-
-# ── Checkpoint helpers ─────────────────────────────────────────────────────────
-def save_checkpoint(key: str, value):
-    cp = {}
-    if CHECKPOINT_FILE.exists():
-        try: cp = json.loads(CHECKPOINT_FILE.read_text())
-        except Exception: cp = {}
-    cp[key] = value
-    CHECKPOINT_FILE.write_text(json.dumps(cp, indent=2))
-
-def load_checkpoint(key: str, default=None):
-    if not CHECKPOINT_FILE.exists(): return default
-    try: return json.loads(CHECKPOINT_FILE.read_text()).get(key, default)
-    except Exception: return default
+def load_cp(key, default=None):
+    try:
+        if CHECKPOINT_FILE.exists():
+            return json.loads(CHECKPOINT_FILE.read_text()).get(key, default)
+    except Exception:
+        pass
+    return default
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # DATABASE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA synchronous=NORMAL')
-    conn.execute('PRAGMA cache_size=30000')
     conn.executescript("""
-    CREATE TABLE IF NOT EXISTS bhavcopy_raw (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
-        expiry_date TEXT NOT NULL, option_type TEXT NOT NULL,
-        strike_price REAL NOT NULL, open_interest REAL DEFAULT 0,
-        oi_change REAL DEFAULT 0, ltp REAL DEFAULT 0,
-        settle_price REAL DEFAULT 0, contracts REAL DEFAULT 0,
-        underlying_value REAL DEFAULT 0,
-        UNIQUE(trade_date,symbol,expiry_date,option_type,strike_price)
+    -- Daily NIFTY closing price (spot)
+    CREATE TABLE IF NOT EXISTS nifty_ohlcv (
+        trade_date  TEXT PRIMARY KEY,
+        open        REAL, high REAL, low REAL, close REAL, volume REAL
     );
-    CREATE INDEX IF NOT EXISTS idx_raw_date ON bhavcopy_raw(trade_date);
-    CREATE INDEX IF NOT EXISTS idx_raw_sym  ON bhavcopy_raw(symbol,trade_date);
 
-    CREATE TABLE IF NOT EXISTS index_ohlcv (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
-        open REAL DEFAULT 0, high REAL DEFAULT 0,
-        low  REAL DEFAULT 0, close REAL DEFAULT 0,
-        volume REAL DEFAULT 0, change_pct REAL DEFAULT 0,
-        source TEXT DEFAULT 'NSE',
-        UNIQUE(trade_date,symbol)
+    -- Per-strike options data fetched from Dhan
+    CREATE TABLE IF NOT EXISTS options_raw (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_date  TEXT NOT NULL,
+        strike      REAL NOT NULL,
+        option_type TEXT NOT NULL,   -- CE or PE
+        open        REAL DEFAULT 0,
+        high        REAL DEFAULT 0,
+        low         REAL DEFAULT 0,
+        close       REAL DEFAULT 0,  -- LTP / settlement
+        volume      REAL DEFAULT 0,
+        open_interest REAL DEFAULT 0,
+        spot_price  REAL DEFAULT 0,
+        UNIQUE(trade_date, strike, option_type)
     );
-    CREATE INDEX IF NOT EXISTS idx_ohlcv_sym ON index_ohlcv(symbol,trade_date);
 
+    -- Computed GEX per strike per day
     CREATE TABLE IF NOT EXISTS gex_per_strike (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
-        expiry_date TEXT NOT NULL, strike_price REAL NOT NULL,
-        tte_days REAL, spot_price REAL,
-        call_oi REAL DEFAULT 0, put_oi REAL DEFAULT 0,
-        oi_total REAL DEFAULT 0, pcr_strike REAL DEFAULT 0,
-        call_iv REAL DEFAULT 0, put_iv REAL DEFAULT 0, iv_avg REAL DEFAULT 0,
-        call_gamma REAL DEFAULT 0, put_gamma REAL DEFAULT 0,
-        call_vanna REAL DEFAULT 0, put_vanna REAL DEFAULT 0,
-        call_delta REAL DEFAULT 0, put_delta REAL DEFAULT 0,
-        net_gex REAL DEFAULT 0, net_vanna REAL DEFAULT 0,
-        net_dex REAL DEFAULT 0, enhanced_oi_gex REAL DEFAULT 0,
-        UNIQUE(trade_date,symbol,expiry_date,strike_price)
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_date  TEXT NOT NULL,
+        strike      REAL NOT NULL,
+        spot_price  REAL,
+        tte_days    REAL,
+        call_ltp    REAL, put_ltp  REAL,
+        call_oi     REAL, put_oi   REAL,
+        call_iv     REAL, put_iv   REAL,
+        call_gamma  REAL, put_gamma REAL,
+        call_vanna  REAL, put_vanna REAL,
+        call_delta  REAL, put_delta REAL,
+        net_gex     REAL, net_vanna REAL, net_dex REAL,
+        UNIQUE(trade_date, strike)
     );
-    CREATE INDEX IF NOT EXISTS idx_ps_date ON gex_per_strike(trade_date,symbol);
 
-    CREATE TABLE IF NOT EXISTS gex_daily_summary (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, spot_price REAL,
-        net_gex_total REAL, net_gex_positive REAL, net_gex_negative REAL,
-        gex_ratio REAL, gex_regime TEXT,
-        net_vanna_total REAL, net_vanna_positive REAL, net_vanna_negative REAL,
-        vanna_regime TEXT, net_dex_total REAL, dex_regime TEXT,
-        gex_flip_zone_1 REAL, gex_flip_zone_2 REAL, n_flip_zones INTEGER,
-        dominant_call_wall REAL, dominant_put_wall REAL, max_pain_strike REAL,
-        total_call_oi REAL, total_put_oi REAL, pcr REAL, total_oi REAL,
-        atm_call_iv REAL, atm_put_iv REAL, iv_skew REAL, iv_regime TEXT,
-        avg_call_iv REAL, avg_put_iv REAL,
-        bear_cascade_fuel REAL, bear_cascade_absorption REAL, bear_cascade_net REAL,
-        bull_cascade_fuel REAL, bull_cascade_absorption REAL, bull_cascade_net REAL,
-        cascade_bias TEXT, n_vanna_zones INTEGER, n_vacuum_zones INTEGER,
-        n_resistance_ceilings INTEGER, n_trap_doors INTEGER, n_support_floors INTEGER,
-        nearest_vacuum_above REAL, nearest_support_below REAL, nearest_trap_below REAL,
-        n_strikes INTEGER, n_expiries INTEGER,
-        index_return_1d REAL, index_return_3d REAL, index_return_5d REAL,
-        index_intraday_range REAL, realized_vol_5d REAL, realized_vol_21d REAL,
-        created_at TEXT DEFAULT (datetime('now')),
-        UNIQUE(trade_date,symbol)
+    -- Daily GEX aggregate (one row per day — the research table)
+    CREATE TABLE IF NOT EXISTS gex_daily (
+        trade_date          TEXT PRIMARY KEY,
+        spot_price          REAL,
+        total_net_gex       REAL,
+        total_pos_gex       REAL,
+        total_neg_gex       REAL,
+        total_net_vanna     REAL,
+        total_net_dex       REAL,
+        gex_regime          TEXT,   -- POSITIVE / NEGATIVE / NEUTRAL
+        dominant_call_wall  REAL,   -- strike with highest +GEX
+        dominant_put_wall   REAL,   -- strike with highest -GEX
+        gex_flip_zone       REAL,   -- nearest zero-crossing strike
+        atm_call_iv         REAL,
+        atm_put_iv          REAL,
+        iv_skew             REAL,   -- put_iv - call_iv at ATM
+        pcr                 REAL,   -- put/call OI ratio
+        total_call_oi       REAL,
+        total_put_oi        REAL,
+        n_strikes           INTEGER
     );
-    CREATE INDEX IF NOT EXISTS idx_sum_date ON gex_daily_summary(trade_date,symbol);
 
-    CREATE TABLE IF NOT EXISTS download_log (
-        trade_date TEXT PRIMARY KEY, status TEXT,
-        rows_stored INTEGER DEFAULT 0, error_msg TEXT,
-        updated_at TEXT DEFAULT (datetime('now'))
+    -- Download progress tracker
+    CREATE TABLE IF NOT EXISTS fetch_log (
+        trade_date  TEXT NOT NULL,
+        strike      REAL NOT NULL,
+        option_type TEXT NOT NULL,
+        status      TEXT,           -- ok / error / no_data
+        error_msg   TEXT,
+        PRIMARY KEY(trade_date, strike, option_type)
     );
     """)
     conn.commit()
     return conn
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# BLACK-SCHOLES — same as dashboard
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# BLACK-SCHOLES
+# ═════════════════════════════════════════════════════════════════════════════
 def _d1(S, K, T, r, sig):
-    return (np.log(S/np.maximum(K,1e-6))+(r+0.5*sig**2)*T)/np.maximum(sig*np.sqrt(max(T,1/365)),1e-10)
+    T = max(T, 1/365)
+    return (np.log(S / max(K, 1e-6)) + (r + 0.5*sig**2)*T) / max(sig*np.sqrt(T), 1e-10)
 
-def bs_gamma_v(S,K,T,r,s): return norm.pdf(_d1(S,K,T,r,s))/np.maximum(S*s*np.sqrt(max(T,1/365)),1e-10)
-def bs_vanna_v(S,K,T,r,s):
-    d1=_d1(S,K,T,r,s); return -norm.pdf(d1)*(d1-s*np.sqrt(max(T,1/365)))/np.maximum(s,1e-10)
-def bs_dc(S,K,T,r,s): return norm.cdf(_d1(S,K,T,r,s))
-def bs_dp(S,K,T,r,s): return norm.cdf(_d1(S,K,T,r,s))-1.0
+def bs_gamma(S, K, T, r, sig):
+    return norm.pdf(_d1(S, K, T, r, sig)) / max(S * sig * np.sqrt(max(T,1/365)), 1e-10)
 
-def bs_price(S,K,T,r,sig,ot='CE'):
-    if T<=0 or sig<=0: return max(S-K,0) if ot=='CE' else max(K-S,0)
-    d1=_d1(S,np.array([K]),T,r,np.array([sig]))[0]; d2=d1-sig*np.sqrt(T)
-    return float(S*norm.cdf(d1)-K*np.exp(-r*T)*norm.cdf(d2)) if ot=='CE' \
-           else float(K*np.exp(-r*T)*norm.cdf(-d2)-S*norm.cdf(-d1))
+def bs_vanna(S, K, T, r, sig):
+    d1 = _d1(S, K, T, r, sig)
+    d2 = d1 - sig * np.sqrt(max(T, 1/365))
+    return -norm.pdf(d1) * d2 / max(sig, 1e-10)
 
-def solve_iv(price,S,K,T,r,ot='CE',tol=1e-5,n=80) -> float:
-    if price<=0 or T<=0: return 0.0
-    if price < (max(S-K,0) if ot=='CE' else max(K-S,0)): return 0.0
-    lo,hi = 0.001,5.0
-    for _ in range(n):
-        mid=( lo+hi)/2; p=bs_price(S,K,T,r,mid,ot)
-        if abs(p-price)<tol: return mid*100
-        if p<price: lo=mid
-        else:       hi=mid
-    return mid*100
+def bs_delta(S, K, T, r, sig, otype='CE'):
+    d1 = _d1(S, K, T, r, sig)
+    return norm.cdf(d1) if otype == 'CE' else norm.cdf(d1) - 1.0
 
+def bs_price(S, K, T, r, sig, otype='CE'):
+    if T <= 0 or sig <= 0:
+        return max(S-K, 0) if otype == 'CE' else max(K-S, 0)
+    d1 = _d1(S, K, T, r, sig)
+    d2 = d1 - sig * np.sqrt(T)
+    if otype == 'CE':
+        return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    return K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GEX ANALYTICS — same as dashboard
-# ═══════════════════════════════════════════════════════════════════════════════
-def gamma_flip_zones(df,spot):
-    df_s=df.sort_values('strike_price').reset_index(drop=True); out=[]
-    for i in range(len(df_s)-1):
-        g1,g2=float(df_s.loc[i,'net_gex']),float(df_s.loc[i+1,'net_gex'])
-        if g1*g2<0:
-            k1,k2=float(df_s.loc[i,'strike_price']),float(df_s.loc[i+1,'strike_price'])
-            out.append({'strike':k1+(k2-k1)*abs(g1)/(abs(g1)+abs(g2)),'below_spot':(k1+(k2-k1)*abs(g1)/(abs(g1)+abs(g2)))<spot})
-    return out
-
-def vanna_flip_zones(df,spot):
-    df_s=df.sort_values('strike_price').reset_index(drop=True); out=[]
-    rm={(True,True):('VACUUM_ZONE','#10b981'),(True,False):('RESISTANCE_CEILING','#ef4444'),
-        (False,True):('SUPPORT_FLOOR','#06b6d4'),(False,False):('TRAP_DOOR','#f59e0b')}
-    for i in range(len(df_s)-1):
-        v1,v2=float(df_s.loc[i,'net_vanna']),float(df_s.loc[i+1,'net_vanna'])
-        if v1*v2<0:
-            k1,k2=float(df_s.loc[i,'strike_price']),float(df_s.loc[i+1,'strike_price'])
-            k=k1+(k2-k1)*abs(v1)/(abs(v1)+abs(v2))
-            role,color=rm.get((k>spot,v1>0),('NEUTRAL','#94a3b8'))
-            out.append({'strike':k,'role':role,'color':color,'above':k>spot,'pos2neg':v1>0})
-    return out
-
-def iv_trend(df):
-    ac=df['call_iv'].replace(0,np.nan).mean() or 25; ap=df['put_iv'].replace(0,np.nan).mean() or 25
-    sk=ap-ac; rg='EXPANDING' if sk>5 else('COMPRESSING' if sk<-2 else 'FLAT')
-    return {'regime':rg,'skew':round(sk,2)}
-
-def gex_cascade(df,spot,cfg,vzones,iv_regime):
-    if df.empty: return {}
-    pot=cfg['total_cascade_pot']
-    VA={'SUPPORT_FLOOR':{'COMPRESSING':-0.60,'FLAT':-0.35,'EXPANDING':0.20},
-        'TRAP_DOOR':{'COMPRESSING':0,'FLAT':0,'EXPANDING':0.30},
-        'VACUUM_ZONE':{'COMPRESSING':0,'FLAT':0,'EXPANDING':-0.50},
-        'RESISTANCE_CEILING':{'COMPRESSING':0,'FLAT':0,'EXPANDING':0.20}}
-    df_s=df.sort_values('strike_price').reset_index(drop=True)
-    bear=df_s[df_s['strike_price']<=spot].sort_values('strike_price',ascending=False)
-    bull=df_s[df_s['strike_price']>spot].sort_values('strike_price',ascending=True)
-    ivl=df_s['strike_price'].diff().abs().mode(); ivl=float(ivl.iloc[0]) if len(ivl)>0 else 50.0
-    res={}
-    for direction,sub in [('BEAR',bear),('BULL',bull)]:
-        if sub.empty: res[direction]={'fuel':0,'absorption':0,'net':0}; continue
-        gv=sub['net_gex'].fillna(0).to_numpy(float); tot=np.abs(gv).sum()
-        if tot==0: res[direction]={'fuel':0,'absorption':0,'net':0}; continue
-        fuel=0.0; ab=0.0
-        for _,row in sub.iterrows():
-            g=float(row['net_gex']); w=abs(g)/tot; rp=w*pot/2
-            adj=0.0; md=float('inf'); cl=None
-            for z in vzones:
-                dd=abs(z['strike']-float(row['strike_price']))
-                if dd<md: md=dd; cl=z
-            if cl and md<ivl: adj=VA.get(cl['role'],{}).get(iv_regime,0)*rp
-            ap_=max(0.0,rp+adj)
-            if direction=='BEAR':
-                if g<0: fuel+=ap_
-                else: ab+=ap_
-            else:
-                if g<0: fuel+=ap_
-                else: ab+=ap_
-        res[direction]={'fuel':round(fuel,2),'absorption':round(ab,2),'net':round(max(0,fuel-ab*0.5),2)}
-    return res
-
-def enhanced_oi_gex(df,spot):
-    dist=(df['strike_price']-spot).abs(); dw=1-(dist/max(dist.max(),1))*0.5
-    ai=(df['call_iv'].fillna(25)+df['put_iv'].fillna(25))/2
-    ia=(ai/max(ai.mean(),1)).clip(0.5,2.0)
-    oc=df['call_oi'].fillna(0)*0.05; op_=df['put_oi'].fillna(0)*0.05
-    raw=(oc*df['call_gamma'].abs().fillna(0)-op_*df['put_gamma'].abs().fillna(0))*ia*dw
-    sc=df['net_gex'].abs().mean()/raw.abs().mean() if raw.abs().mean()>0 and df['net_gex'].abs().mean()>0 else 1.0
-    return raw*sc
+def solve_iv(price, S, K, T, r, otype='CE') -> float:
+    """Bisection IV solver — always converges."""
+    if price <= 0 or T <= 0:
+        return 0.0
+    intrinsic = max(S-K, 0) if otype == 'CE' else max(K-S, 0)
+    if price < intrinsic:
+        return 0.0
+    lo, hi = 0.001, 5.0
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        p   = bs_price(S, K, T, r, mid, otype)
+        if abs(p - price) < 1e-5:
+            return mid * 100
+        if p < price:
+            lo = mid
+        else:
+            hi = mid
+    return mid * 100
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# BHAVCOPY DOWNLOADER
-# ═══════════════════════════════════════════════════════════════════════════════
-class BhavCopyDownloader:
-    HDR={'User-Agent':'Mozilla/5.0','Accept-Encoding':'gzip, deflate','Connection':'keep-alive'}
-
-    def __init__(self,conn):
-        self.conn=conn; self.ses=requests.Session(); self.ses.headers.update(self.HDR)
-        try: self.ses.get('https://www.nseindia.com',timeout=10); time.sleep(1)
-        except Exception: pass
-
-    def _urls(self,d):
-        dn=d.strftime('%Y%m%d'); do=d.strftime('%d%b%Y').upper()
-        return [f'https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{dn}_F_0000.csv.zip',
-                f'https://nsearchives.nseindia.com/content/fo/fo{do}bhav.csv.zip',
-                f'https://archives.nseindia.com/content/fo/fo{do}bhav.csv.zip']
-
-    def _fetch(self,d):
-        cache=RAW_DIR/f"{d.strftime('%Y%m%d')}.csv"
-        if cache.exists():
-            try: return pd.read_csv(cache)
-            except Exception: pass
-        for url in self._urls(d):
-            try:
-                r=self.ses.get(url,timeout=30)
-                if r.status_code==200 and len(r.content)>500:
-                    zf=zipfile.ZipFile(io.BytesIO(r.content))
-                    df=pd.read_csv(zf.open(zf.namelist()[0]))
-                    df.to_csv(cache,index=False); return df
-            except Exception as e: log.debug(f"  {url}: {e}")
-        return None
-
-    def _norm(self, df):
-        """
-        Normalise Bhavcopy columns across ALL NSE format versions:
-          Format A (2019-2021): SYMBOL, EXPIRY_DT, OPTION_TYP, STRIKE_PR ...
-          Format B (2022-2023): Symbol, ExpiryDate, OptionType, StrikePrice ...
-          Format C (2024+):     TckrSymb, XpryDt, OptnTp, StrkPric ...
-        """
-        # Store original columns for fallback matching
-        original_cols = list(df.columns)
-
-        # Uppercase + strip for matching (but keep original df intact)
-        upper_map = {c.strip().upper().replace(' ', '_'): c for c in df.columns}
-        df.columns = [c.strip().upper().replace(' ', '_') for c in df.columns]
-
-        AL = {
-            # Symbol / Ticker
-            'SYM': ['TCKRSYMB',           # 2024+ new format
-                    'SYMBOL', 'TRADINGSYMBOL', 'SCRIPCODE',
-                    'FININSTRMID', 'INSTRUMENT', 'INSTRUMENTNAME'],
-            # Expiry date
-            'EXP': ['XPRYDT',             # 2024+ new format
-                    'EXPIRY_DT', 'EXPIRYDATE', 'EXPIRY_DATE', 'EXPIRY',
-                    'XPRY_DT', 'EXPRYDT', 'FININSTRMACTLXPRYDT'],
-            # Option type CE/PE
-            'OPT': ['OPTNTP',             # 2024+ new format
-                    'OPTION_TYP', 'OPTIONTYPE', 'OPTION_TYPE', 'OPT_TYPE',
-                    'OPTTYPE', 'OPTSTYLE', 'CALL_PUT'],
-            # Strike price
-            'STK': ['STRKPRIC',           # 2024+ new format
-                    'STRIKE_PR', 'STRIKEPRICE', 'STRIKE_PRICE', 'STRIKE',
-                    'STRK_PRC', 'EXRCPRIC'],
-            # Open interest
-            'OI':  ['OPNINTRST',          # 2024+ new format
-                    'OPEN_INT', 'OPENINTEREST', 'OPEN_INTEREST', 'OI',
-                    'OPEN_INT_', 'OPNINT'],
-            # OI change
-            'OIC': ['CHNGINOPNINTRST',    # 2024+ new format
-                    'CHG_IN_OI', 'CHANGE_OI', 'OI_CHANGE', 'CHNG_IN_OI',
-                    'CHANGE_IN_OI', 'CHGOI'],
-            # Last traded price
-            'LTP': ['LASTPRIC',           # 2024+ new format
-                    'LAST', 'LTP', 'CLOSE', 'LAST_PRICE', 'LASTPRICE',
-                    'CLOSE_PRICE', 'CLSPRIC', 'TRADPRC'],
-            # Settlement price
-            'SET': ['STTLMPRIC',          # 2024+ new format
-                    'SETTLE_PR', 'SETTLEMENT_PRICE', 'SETTLEPRICE',
-                    'SETTLE_PRICE', 'STTLPRC', 'FINALPRIC'],
-            # Number of contracts / volume
-            'CTR': ['TTLTRDQTY',          # 2024+ new format
-                    'CONTRACTS', 'NO_OF_CONTRACTS', 'VOLUME', 'QTY',
-                    'TRADEDQTY', 'TTLTTRDQTNTY', 'TTLTRDVAL'],
-            # Underlying price (spot)
-            'UND': ['UNDRLYG_PRC',        # variant
-                    'UNDRLYGPRIC',        # 2024+ new format
-                    'UNDERLYING_VALUE', 'UNDERLYING', 'UNDL_VAL',
-                    'UNDLYING', 'UNDRLYNG', 'UNDERLYING_CLOSE'],
+# ═════════════════════════════════════════════════════════════════════════════
+# DHAN API CLIENT
+# ═════════════════════════════════════════════════════════════════════════════
+class DhanClient:
+    def __init__(self, client_id: str, access_token: str):
+        self.headers = {
+            'access-token': access_token,
+            'client-id':    client_id,
+            'Content-Type': 'application/json',
         }
 
-        def fc(keys):
-            for k in keys:
-                if k in df.columns:
-                    return k
-            return None
+    def _post(self, endpoint: str, payload: dict) -> Optional[dict]:
+        try:
+            r = requests.post(
+                f'{DHAN_BASE}{endpoint}',
+                headers=self.headers,
+                json=payload,
+                timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            log.debug(f"Dhan {endpoint}: HTTP {r.status_code} — {r.text[:200]}")
+        except Exception as e:
+            log.debug(f"Dhan {endpoint} error: {e}")
+        return None
 
-        c = {k: fc(v) for k, v in AL.items()}
-
-        # Fallback: partial match on uppercased column names
-        if not all(c[k] for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']):
-            partial = {
-                'SYM': ['TCKR', 'SYMBOL', 'SCRIP'],
-                'EXP': ['XPRY', 'EXPIR'],
-                'OPT': ['OPTN', 'OPTION', 'CALLPUT'],
-                'STK': ['STRK', 'STRIKE'],
-                'OI':  ['OPNINT', 'OPENINT', 'OPEN_INT'],
-            }
-            for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']:
-                if not c[k]:
-                    for part in partial.get(k, []):
-                        for col in df.columns:
-                            if part in col:
-                                c[k] = col
-                                break
-                        if c[k]:
-                            break
-
-        if not all(c[k] for k in ['SYM', 'EXP', 'OPT', 'STK', 'OI']):
-            log.warning(f"col fail — cols: {list(df.columns[:20])}")
-            return None
-
-        def sa(col, d=0):
-            if col and col in df.columns:
-                s = df[col].astype(str).str.replace(',', '', regex=False)
-                return pd.to_numeric(s, errors='coerce').fillna(d)
-            return pd.Series([d] * len(df))
-
-        result = pd.DataFrame({
-            'symbol':     df[c['SYM']].astype(str).str.strip(),
-            'expiry':     df[c['EXP']].astype(str).str.strip(),
-            'opttype':    df[c['OPT']].astype(str).str.strip().str.upper().str[:2],
-            'strike':     sa(c['STK']),
-            'oi':         sa(c['OI']),
-            'oi_chg':     sa(c['OIC']),
-            'ltp':        sa(c['LTP']),
-            'settle':     sa(c['SET']),
-            'contracts':  sa(c['CTR']),
-            'underlying': sa(c['UND']),
+    def get_nifty_ohlcv(self, from_date: str, to_date: str) -> List[dict]:
+        """
+        Fetch NIFTY 50 daily OHLCV.
+        Returns list of {date, open, high, low, close, volume}
+        """
+        data = self._post('/v2/charts/historical', {
+            'securityId':      NIFTY_SEC_ID,
+            'exchangeSegment': NIFTY_SEGMENT,
+            'instrument':      'INDEX',
+            'expiryCode':      0,
+            'oi_flag':         '0',
+            'fromDate':        from_date,
+            'toDate':          to_date,
         })
-        return result
+        if not data:
+            return []
 
-    def download_range(self,start,end,progress_cb=None):
-        cur=start; total=(end-start).days+1; done=0
-        while cur<=end:
-            done+=1
-            if cur.weekday()>=5: cur+=timedelta(days=1); continue
-            ds=cur.strftime('%Y-%m-%d')
-            row=self.conn.execute("SELECT status FROM download_log WHERE trade_date=?",(ds,)).fetchone()
-            if row and row[0] in ('ok','holiday'):
-                if progress_cb: progress_cb(done/total,f"Skip {ds}")
-                cur+=timedelta(days=1); continue
-            if progress_cb: progress_cb(done/total,f"Downloading {ds}...")
-            log.info(f"Bhavcopy {ds}...")
-            raw=self._fetch(cur)
-            if raw is None:
-                self.conn.execute("INSERT OR REPLACE INTO download_log(trade_date,status) VALUES(?,?)",(ds,'holiday'))
-                self.conn.commit(); cur+=timedelta(days=1); time.sleep(0.5); continue
-            df=self._norm(raw)
-            if df is None:
-                self.conn.execute("INSERT OR REPLACE INTO download_log(trade_date,status,error_msg) VALUES(?,?,?)",(ds,'error','col fail'))
-                self.conn.commit(); cur+=timedelta(days=1); continue
-            mask=df['symbol'].isin(SYMBOLS)&df['opttype'].isin(['CE','PE'])
-            df=df[mask].dropna(subset=['strike'])
-            if df.empty:
-                self.conn.execute("INSERT OR REPLACE INTO download_log(trade_date,status) VALUES(?,?)",(ds,'holiday'))
-                self.conn.commit(); cur+=timedelta(days=1); continue
-            rows=[(ds,r.symbol,r.expiry,r.opttype,float(r.strike),float(r.oi),float(r.oi_chg),
-                   float(r.ltp),float(r.settle),float(r.contracts),float(r.underlying))
-                  for r in df.itertuples()]
-            self.conn.executemany("""INSERT OR IGNORE INTO bhavcopy_raw
-                (trade_date,symbol,expiry_date,option_type,strike_price,open_interest,oi_change,
-                 ltp,settle_price,contracts,underlying_value) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",rows)
-            self.conn.execute("INSERT OR REPLACE INTO download_log(trade_date,status,rows_stored) VALUES(?,?,?)",(ds,'ok',len(rows)))
-            self.conn.commit(); save_checkpoint('last_bhavcopy',ds)
-            log.info(f"  {ds}: {len(rows)} rows"); time.sleep(1.2); cur+=timedelta(days=1)
+        ts   = data.get('timestamp', [])
+        opens  = data.get('open',   [])
+        highs  = data.get('high',   [])
+        lows   = data.get('low',    [])
+        closes = data.get('close',  [])
+        vols   = data.get('volume', [])
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# OHLCV DOWNLOADER
-# ═══════════════════════════════════════════════════════════════════════════════
-class OHLCVDownloader:
-    HDR={'User-Agent':'Mozilla/5.0','Accept':'application/json,*/*',
-         'Referer':'https://www.nseindia.com/'}
-
-    def __init__(self,conn):
-        self.conn=conn; self.ses=requests.Session(); self.ses.headers.update(self.HDR)
-        try:
-            self.ses.get('https://www.nseindia.com',timeout=15); time.sleep(1.5)
-            self.ses.get('https://www.nseindia.com/market-data/live-equity-market',timeout=10); time.sleep(1)
-        except Exception: pass
-
-    def _fetch_chunk(self,symbol,start,end):
-        idx=INDEX_CONFIG.get(symbol,{}).get('nse_index',symbol)
-        cache=OHLCV_DIR/f"{symbol}_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.json"
-        if cache.exists():
-            try: return json.loads(cache.read_text())
-            except Exception: pass
-        url="https://www.nseindia.com/api/historicalindices"
-        params={'indexType':idx,'from':start.strftime('%d-%m-%Y'),'to':end.strftime('%d-%m-%Y')}
-        try:
-            r=self.ses.get(url,params=params,timeout=30)
-            if r.status_code==200:
-                data=r.json().get('data',[])
-                if data: cache.write_text(json.dumps(data)); return data
-            log.debug(f"  OHLCV {symbol} {start}-{end}: {r.status_code}")
-        except Exception as e: log.debug(f"  {e}")
-        return []
-
-    def _parse(self,data,symbol):
-        rows=[]; cn={'date':['HistoricalDate','date','INDEX_DATE'],
-            'o':['OPEN','open'],'h':['HIGH','high'],'l':['LOW','low'],
-            'c':['CLOSING','CLOSE','close','Closing Index Value'],'v':['TRADED_VOLUME','volume']}
-        for item in data:
+        rows = []
+        for i, t in enumerate(ts):
             try:
-                def gv(keys):
-                    for k in keys:
-                        if k in item: return item[k]
-                    return None
-                raw_dt=str(gv(cn['date']) or '').strip()
-                td=None
-                for fmt in ['%d-%b-%Y','%Y-%m-%d','%d/%m/%Y']:
-                    try: td=datetime.strptime(raw_dt,fmt).strftime('%Y-%m-%d'); break
-                    except: pass
-                if not td: continue
-                o=float(str(gv(cn['o']) or '0').replace(',',''))
-                h=float(str(gv(cn['h']) or '0').replace(',',''))
-                l=float(str(gv(cn['l']) or '0').replace(',',''))
-                c_=float(str(gv(cn['c']) or '0').replace(',',''))
-                v=float(str(gv(cn['v']) or '0').replace(',',''))
-                chg=((c_-o)/o*100) if o>0 else 0
-                rows.append((td,symbol,o,h,l,c_,v,round(chg,4)))
-            except Exception: continue
+                d = datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d')
+                rows.append({
+                    'date':   d,
+                    'open':   float(opens[i])  if i < len(opens)  else 0,
+                    'high':   float(highs[i])  if i < len(highs)  else 0,
+                    'low':    float(lows[i])   if i < len(lows)   else 0,
+                    'close':  float(closes[i]) if i < len(closes) else 0,
+                    'volume': float(vols[i])   if i < len(vols)   else 0,
+                })
+            except Exception:
+                continue
         return rows
 
-    def download_range(self,start,end,progress_cb=None):
-        for si,sym in enumerate(SYMBOLS):
-            if progress_cb: progress_cb(si/len(SYMBOLS),f"OHLCV: {sym}")
-            log.info(f"OHLCV {sym}...")
-            all_rows=[]; cs=start
-            while cs<=end:
-                ce=min(cs+timedelta(days=180),end)
-                data=self._fetch_chunk(sym,cs,ce)
-                if data:
-                    r=self._parse(data,sym); all_rows.extend(r)
-                    log.info(f"  {sym} {cs}→{ce}: {len(r)} rows")
-                else:
-                    log.warning(f"  {sym} {cs}→{ce}: no data")
-                cs=ce+timedelta(days=1); time.sleep(2)
-            if all_rows:
-                self.conn.executemany("""INSERT OR REPLACE INTO index_ohlcv
-                    (trade_date,symbol,open,high,low,close,volume,change_pct) VALUES(?,?,?,?,?,?,?,?)""",all_rows)
-                self.conn.commit(); save_checkpoint(f'ohlcv_{sym}',str(end))
-                log.info(f"  {sym}: {len(all_rows)} total rows")
-        if progress_cb: progress_cb(1.0,"OHLCV complete")
+    def get_option_ohlcv(self, security_id: str,
+                          from_date: str, to_date: str) -> List[dict]:
+        """
+        Fetch daily OHLCV + OI for a specific option contract.
+        Dhan returns OI in the 'oi' field when oi_flag='1'.
+        """
+        data = self._post('/v2/charts/historical', {
+            'securityId':      security_id,
+            'exchangeSegment': NIFTY_FO_SEG,
+            'instrument':      'OPTIDX',
+            'expiryCode':      0,
+            'oi_flag':         '1',     # request OI data
+            'fromDate':        from_date,
+            'toDate':          to_date,
+        })
+        if not data:
+            return []
+
+        ts      = data.get('timestamp', [])
+        closes  = data.get('close',  [])
+        volumes = data.get('volume', [])
+        ois     = data.get('oi',     [])
+
+        rows = []
+        for i, t in enumerate(ts):
+            try:
+                d = datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d')
+                rows.append({
+                    'date':  d,
+                    'close': float(closes[i])  if i < len(closes)  else 0,
+                    'vol':   float(volumes[i]) if i < len(volumes) else 0,
+                    'oi':    float(ois[i])     if i < len(ois)     else 0,
+                })
+            except Exception:
+                continue
+        return rows
+
+    def search_option_security_id(self, strike: float,
+                                   expiry_date: str,
+                                   option_type: str) -> Optional[str]:
+        """
+        Find the Dhan security_id for a specific NIFTY option contract.
+        Uses Dhan's option chain search endpoint.
+        expiry_date: 'YYYY-MM-DD'
+        option_type: 'CE' or 'PE'
+        """
+        try:
+            r = requests.get(
+                f'{DHAN_BASE}/v2/optionchain',
+                headers=self.headers,
+                params={
+                    'UnderlyingScrip': 'NIFTY',
+                    'UnderlyingSeg':   'IDX_I',
+                    'Expiry':          expiry_date,
+                },
+                timeout=15)
+            if r.status_code != 200:
+                return None
+            chain = r.json().get('data', [])
+            for item in chain:
+                if abs(float(item.get('strikePrice', 0)) - strike) < 1:
+                    side = item.get('callOption' if option_type == 'CE' else 'putOption', {})
+                    if side:
+                        return str(side.get('securityId', ''))
+        except Exception as e:
+            log.debug(f"Security ID search error: {e}")
+        return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GEX COMPUTE ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-class GEXEngine:
+# ═════════════════════════════════════════════════════════════════════════════
+# NIFTY EXPIRY HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+def get_next_thursday(from_date: date) -> date:
+    """Get the next/current Thursday (NSE weekly expiry day)."""
+    d = from_date
+    while d.weekday() != 3:  # 3 = Thursday
+        d += timedelta(days=1)
+    return d
 
-    def __init__(self,conn): self.conn=conn
+def get_monthly_expiry(from_date: date) -> date:
+    """Last Thursday of the month."""
+    # Go to last day of month, then back to Thursday
+    if from_date.month == 12:
+        next_month = date(from_date.year+1, 1, 1)
+    else:
+        next_month = date(from_date.year, from_date.month+1, 1)
+    last_day = next_month - timedelta(days=1)
+    while last_day.weekday() != 3:
+        last_day -= timedelta(days=1)
+    return last_day
 
-    def _tte(self,td,exp):
-        for fmt in ['%d-%b-%Y','%Y-%m-%d','%d/%m/%Y','%d-%b-%y']:
-            try: return max((datetime.strptime(exp.strip(),fmt)-datetime.strptime(td,'%Y-%m-%d')).days/365.0,1/365)
-            except: pass
-        return 7/365
+def atm_strike(spot: float) -> float:
+    """Round spot to nearest NIFTY strike (multiple of 50)."""
+    return round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL
 
-    def _pending(self):
-        # Remove underlying_value>0 filter — spot now comes from OHLCV fallback
-        # so ALL dates with bhavcopy data are eligible, even if underlying_value=0
-        return self.conn.execute("""
-            SELECT DISTINCT b.trade_date, b.symbol
-            FROM bhavcopy_raw b
-            LEFT JOIN gex_daily_summary g
-                ON b.trade_date = g.trade_date AND b.symbol = g.symbol
+def strike_range(atm: float) -> List[float]:
+    """ATM-15 to ATM+15, step 50."""
+    return [atm + i * STRIKE_INTERVAL for i in range(-ATM_RANGE, ATM_RANGE+1)]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN COLLECTOR
+# ═════════════════════════════════════════════════════════════════════════════
+class GEXCollector:
+    def __init__(self, conn: sqlite3.Connection, client: DhanClient):
+        self.conn   = conn
+        self.client = client
+
+    # ── Step 1: Download NIFTY OHLCV ─────────────────────────────────────────
+    def fetch_nifty_prices(self, start: date, end: date,
+                            progress_cb=None) -> int:
+        """Fetch NIFTY closing prices — needed for ATM calculation."""
+        log.info(f"Fetching NIFTY OHLCV {start} → {end}...")
+
+        # Chunk into 365-day windows (Dhan limit)
+        total_rows = 0
+        chunk_start = start
+        chunk_num   = 0
+        total_chunks = max(1, (end - start).days // 364 + 1)
+
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=364), end)
+            chunk_num += 1
+            if progress_cb:
+                progress_cb(chunk_num / total_chunks,
+                            f"NIFTY prices {chunk_start} → {chunk_end}")
+
+            rows = self.client.get_nifty_ohlcv(
+                chunk_start.strftime('%Y-%m-%d'),
+                chunk_end.strftime('%Y-%m-%d'))
+
+            if rows:
+                self.conn.executemany("""
+                    INSERT OR REPLACE INTO nifty_ohlcv
+                    (trade_date, open, high, low, close, volume)
+                    VALUES (:date, :open, :high, :low, :close, :volume)
+                """, rows)
+                self.conn.commit()
+                total_rows += len(rows)
+                log.info(f"  Chunk {chunk_num}: {len(rows)} days")
+
+            chunk_start = chunk_end + timedelta(days=1)
+            time.sleep(0.5)
+
+        log.info(f"NIFTY OHLCV complete: {total_rows} trading days")
+        return total_rows
+
+    # ── Step 2: Fetch option data for all strikes ─────────────────────────────
+    def fetch_options_data(self, start: date, end: date,
+                            progress_cb=None):
+        """
+        For each trading day:
+          1. Get NIFTY close → compute ATM
+          2. Build strike list (ATM ± 15)
+          3. Find nearest weekly expiry
+          4. Fetch Dhan historical OHLCV+OI for each strike CE+PE
+        """
+        # Get all trading days where we have NIFTY prices
+        trading_days = self.conn.execute("""
+            SELECT trade_date, close FROM nifty_ohlcv
+            WHERE trade_date >= ? AND trade_date <= ?
+            ORDER BY trade_date
+        """, (start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))).fetchall()
+
+        total = len(trading_days)
+        log.info(f"Fetching options for {total} trading days...")
+
+        # Pre-build expiry→security_id cache to reduce API calls
+        sec_id_cache = {}  # (strike, expiry, otype) → security_id
+
+        for day_idx, (date_str, spot) in enumerate(trading_days):
+            if progress_cb:
+                progress_cb(day_idx / total,
+                            f"Options {date_str} (ATM={atm_strike(spot):.0f})")
+
+            atm   = atm_strike(spot)
+            strikes = strike_range(atm)
+            trade_date = date.fromisoformat(date_str)
+            expiry = get_next_thursday(trade_date)
+
+            # If expiry is today, use next week's expiry
+            if expiry == trade_date:
+                expiry = get_next_thursday(trade_date + timedelta(days=1))
+
+            expiry_str = expiry.strftime('%Y-%m-%d')
+
+            for strike in strikes:
+                for otype in ['CE', 'PE']:
+                    # Check if already fetched
+                    existing = self.conn.execute("""
+                        SELECT status FROM fetch_log
+                        WHERE trade_date=? AND strike=? AND option_type=?
+                    """, (date_str, strike, otype)).fetchone()
+                    if existing and existing[0] == 'ok':
+                        continue
+
+                    # Get security ID
+                    cache_key = (strike, expiry_str, otype)
+                    sec_id = sec_id_cache.get(cache_key)
+                    if not sec_id:
+                        sec_id = self.client.search_option_security_id(
+                            strike, expiry_str, otype)
+                        if sec_id:
+                            sec_id_cache[cache_key] = sec_id
+
+                    if not sec_id:
+                        self.conn.execute("""
+                            INSERT OR REPLACE INTO fetch_log
+                            (trade_date, strike, option_type, status, error_msg)
+                            VALUES (?,?,?,'error','no_security_id')
+                        """, (date_str, strike, otype))
+                        self.conn.commit()
+                        continue
+
+                    # Fetch OHLCV+OI for this specific contract
+                    # We only need the single day, but Dhan needs a range
+                    rows = self.client.get_option_ohlcv(
+                        sec_id,
+                        date_str,
+                        date_str)
+
+                    # Find the row matching our trade date
+                    day_row = next((r for r in rows if r['date'] == date_str), None)
+
+                    if day_row:
+                        self.conn.execute("""
+                            INSERT OR REPLACE INTO options_raw
+                            (trade_date, strike, option_type,
+                             close, volume, open_interest, spot_price)
+                            VALUES (?,?,?,?,?,?,?)
+                        """, (date_str, strike, otype,
+                              day_row['close'], day_row['vol'],
+                              day_row['oi'], spot))
+                        self.conn.execute("""
+                            INSERT OR REPLACE INTO fetch_log
+                            (trade_date, strike, option_type, status)
+                            VALUES (?,?,?,'ok')
+                        """, (date_str, strike, otype))
+                    else:
+                        self.conn.execute("""
+                            INSERT OR REPLACE INTO fetch_log
+                            (trade_date, strike, option_type, status)
+                            VALUES (?,?,?,'no_data')
+                        """, (date_str, strike, otype))
+
+                    self.conn.commit()
+                    time.sleep(0.1)  # gentle rate limit
+
+            save_cp('last_options_date', date_str)
+            log.info(f"  [{day_idx+1}/{total}] {date_str} ATM={atm:.0f}")
+
+    # ── Step 3: Compute GEX ───────────────────────────────────────────────────
+    def compute_gex(self, progress_cb=None):
+        """
+        For each day with options data, compute:
+        IV (BS bisection) → Gamma, Vanna, Delta → GEX, VANNA, DEX
+        Then aggregate to daily summary.
+        """
+        # Get all dates with options data not yet in gex_per_strike
+        pending = self.conn.execute("""
+            SELECT DISTINCT o.trade_date
+            FROM options_raw o
+            LEFT JOIN gex_daily g ON o.trade_date = g.trade_date
             WHERE g.trade_date IS NULL
-            ORDER BY b.trade_date, b.symbol
+            ORDER BY o.trade_date
         """).fetchall()
 
-    def compute_all(self,progress_cb=None):
-        pending=self._pending(); total=len(pending)
-        log.info(f"Computing GEX for {total} pairs...")
-        for i,(ds,sym) in enumerate(pending,1):
-            if progress_cb: progress_cb(i/total,f"GEX: {ds} {sym}")
-            try: self._day(ds,sym)
-            except Exception as e: log.error(f"  {ds} {sym}: {e}",exc_info=True)
-            if i%10==0: save_checkpoint('last_gex',f"{ds}_{sym}")
-        log.info("GEX done.")
+        total = len(pending)
+        log.info(f"Computing GEX for {total} days...")
 
-    def _day(self,ds,sym):
-        cfg=INDEX_CONFIG.get(sym,INDEX_CONFIG['NIFTY'])
-        div=cfg['unit_divisor']; lot=cfg['lot_size']
-        rows=self.conn.execute("""SELECT expiry_date,option_type,strike_price,
-            open_interest,oi_change,ltp,settle_price,underlying_value
-            FROM bhavcopy_raw WHERE trade_date=? AND symbol=?""",(ds,sym)).fetchall()
-        if not rows: return
-        df=pd.DataFrame(rows,columns=['expiry','opt','strike','oi','oic','ltp','set','und'])
-        df['price']=df.apply(lambda r:r['set'] if r['ltp']==0 else r['ltp'],axis=1)
-        # Try underlying_value from bhavcopy first
-        und_vals = df['und'].replace(0, np.nan).dropna()
-        spot = float(und_vals.iloc[0]) if len(und_vals) > 0 else 0
+        for i, (date_str,) in enumerate(pending):
+            if progress_cb:
+                progress_cb(i / total, f"GEX compute: {date_str}")
+            try:
+                self._compute_day(date_str)
+            except Exception as e:
+                log.error(f"  GEX error {date_str}: {e}")
+            if i % 10 == 0:
+                save_cp('last_gex_date', date_str)
 
-        # Fallback: use OHLCV close price (Dhan API data — exchange grade)
-        # This handles 2019-2023 dates where NSE Bhavcopy had underlying_value=0
-        if spot <= 0:
-            ohlcv_row = self.conn.execute(
-                "SELECT close FROM index_ohlcv WHERE trade_date=? AND symbol=? LIMIT 1",
-                (ds, sym)
-            ).fetchone()
-            if ohlcv_row and ohlcv_row[0] and float(ohlcv_row[0]) > 0:
-                spot = float(ohlcv_row[0])
+        log.info("GEX computation complete.")
 
-        # Final fallback: derive from ATM strike (put-call parity approximation)
-        if spot <= 0:
-            # ATM strike is approximately equal to spot — use median strike
-            # of options with highest OI as rough spot proxy
-            top_oi = df.nlargest(10, 'oi')
-            if not top_oi.empty:
-                spot = float(top_oi['strike'].median())
+    def _compute_day(self, date_str: str):
+        """Compute GEX for one trading day."""
+        # Get options data
+        rows = self.conn.execute("""
+            SELECT strike, option_type, close, open_interest, spot_price
+            FROM options_raw
+            WHERE trade_date = ? AND open_interest > 0
+            ORDER BY strike
+        """, (date_str,)).fetchall()
 
-        if spot <= 0:
-            log.warning(f"  No spot price for {ds} {sym} — skipping")
+        if not rows:
             return
-        ar=[]
-        for exp in df['expiry'].unique():
-            tte=self._tte(ds,exp); de=df[df['expiry']==exp]
-            calls=de[de['opt']=='CE'].set_index('strike'); puts=de[de['opt']=='PE'].set_index('strike')
-            ks=sorted(set(calls.index)|set(puts.index));
-            if not ks: continue
-            K=np.array(ks,float)
-            civ=np.zeros(len(K)); piv=np.zeros(len(K))
-            for j,k in enumerate(K):
-                if k in calls.index: civ[j]=solve_iv(float(calls.loc[k,'price']),spot,k,tte,RISK_FREE_RATE,'CE')
-                if k in puts.index:  piv[j]=solve_iv(float(puts.loc[k,'price']),spot,k,tte,RISK_FREE_RATE,'PE')
-            ai=int(np.argmin(np.abs(K-spot))); ac=civ[ai] or 25; ap=piv[ai] or 25
-            civ[civ==0]=ac; piv[piv==0]=ap
-            cf=np.clip(civ,1,500)/100; pf=np.clip(piv,1,500)/100
-            cg=bs_gamma_v(spot,K,tte,RISK_FREE_RATE,cf); pg=bs_gamma_v(spot,K,tte,RISK_FREE_RATE,pf)
-            cv=bs_vanna_v(spot,K,tte,RISK_FREE_RATE,cf); pv_=bs_vanna_v(spot,K,tte,RISK_FREE_RATE,pf)
-            cd=bs_dc(spot,K,tte,RISK_FREE_RATE,cf); pd_=bs_dp(spot,K,tte,RISK_FREE_RATE,pf)
-            for j,k in enumerate(K):
-                co=float(calls.loc[k,'oi'])*lot if k in calls.index else 0
-                po=float(puts.loc[k,'oi'])*lot  if k in puts.index  else 0
-                ar.append({'expiry':exp,'strike_price':k,'tte_days':round(tte*365,1),
-                    'call_oi':co,'put_oi':po,'call_iv':round(civ[j],2),'put_iv':round(piv[j],2),
-                    'call_gamma':cg[j],'put_gamma':pg[j],'call_vanna':cv[j],'put_vanna':pv_[j],
-                    'call_delta':cd[j],'put_delta':pd_[j],
-                    'net_gex':(co*cg[j]-po*pg[j])*spot**2/div,
-                    'net_vanna':(co*cv[j]-po*pv_[j])/div,
-                    'net_dex':(co*cd[j]+po*pd_[j])/div,
-                    'oi_total':co+po,'pcr_strike':po/max(co,1)})
-        if not ar: return
-        df2=pd.DataFrame(ar); df2['enhanced_oi_gex']=enhanced_oi_gex(df2,spot)
-        for _,r in df2.iterrows():
-            self.conn.execute("""INSERT OR IGNORE INTO gex_per_strike
-                (trade_date,symbol,expiry_date,strike_price,tte_days,spot_price,
-                 call_oi,put_oi,oi_total,pcr_strike,call_iv,put_iv,iv_avg,
-                 call_gamma,put_gamma,call_vanna,put_vanna,call_delta,put_delta,
-                 net_gex,net_vanna,net_dex,enhanced_oi_gex)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (ds,sym,r['expiry'],r['strike_price'],r['tte_days'],spot,
-                 r['call_oi'],r['put_oi'],r['oi_total'],r['pcr_strike'],
-                 r['call_iv'],r['put_iv'],(r['call_iv']+r['put_iv'])/2,
-                 r['call_gamma'],r['put_gamma'],r['call_vanna'],r['put_vanna'],
-                 r['call_delta'],r['put_delta'],r['net_gex'],r['net_vanna'],r['net_dex'],r['enhanced_oi_gex']))
+
+        df = pd.DataFrame(rows, columns=['strike','otype','ltp','oi','spot'])
+        spot = float(df['spot'].iloc[0])
+        if spot <= 0:
+            # Try NIFTY OHLCV
+            row = self.conn.execute(
+                "SELECT close FROM nifty_ohlcv WHERE trade_date=?",
+                (date_str,)).fetchone()
+            if row:
+                spot = float(row[0])
+        if spot <= 0:
+            return
+
+        # Time to expiry — use nearest Thursday
+        trade_date = date.fromisoformat(date_str)
+        expiry     = get_next_thursday(trade_date)
+        if expiry == trade_date:
+            expiry = get_next_thursday(trade_date + timedelta(days=1))
+        tte = max((expiry - trade_date).days / 365.0, 1/365)
+
+        # Pivot to call/put per strike
+        calls = df[df['otype']=='CE'].set_index('strike')
+        puts  = df[df['otype']=='PE'].set_index('strike')
+        strikes = sorted(set(calls.index) | set(puts.index))
+
+        if not strikes:
+            return
+
+        strike_rows = []
+        for K in strikes:
+            c_ltp = float(calls.loc[K,'ltp']) if K in calls.index else 0
+            p_ltp = float(puts.loc[K,'ltp'])  if K in puts.index  else 0
+            c_oi  = float(calls.loc[K,'oi'])  * LOT_SIZE if K in calls.index else 0
+            p_oi  = float(puts.loc[K,'oi'])   * LOT_SIZE if K in puts.index  else 0
+
+            # Solve IV
+            c_iv = solve_iv(c_ltp, spot, K, tte, RISK_FREE, 'CE') if c_ltp > 0 else 0
+            p_iv = solve_iv(p_ltp, spot, K, tte, RISK_FREE, 'PE') if p_ltp > 0 else 0
+
+            # Fill zero IVs with 25% default
+            c_iv = c_iv or 25.0
+            p_iv = p_iv or 25.0
+
+            c_sig = np.clip(c_iv, 1, 500) / 100
+            p_sig = np.clip(p_iv, 1, 500) / 100
+
+            # BS Greeks
+            c_g = bs_gamma(spot, K, tte, RISK_FREE, c_sig)
+            p_g = bs_gamma(spot, K, tte, RISK_FREE, p_sig)
+            c_v = bs_vanna(spot, K, tte, RISK_FREE, c_sig)
+            p_v = bs_vanna(spot, K, tte, RISK_FREE, p_sig)
+            c_d = bs_delta(spot, K, tte, RISK_FREE, c_sig, 'CE')
+            p_d = bs_delta(spot, K, tte, RISK_FREE, p_sig, 'PE')
+
+            # GEX, VANNA, DEX (same formula as live dashboard)
+            net_gex   = (c_oi*c_g - p_oi*p_g) * spot**2 / UNIT_DIV
+            net_vanna = (c_oi*c_v - p_oi*p_v) / UNIT_DIV
+            net_dex   = (c_oi*c_d + p_oi*p_d) / UNIT_DIV
+
+            strike_rows.append({
+                'strike':      K,
+                'spot':        spot,
+                'tte_days':    round(tte * 365, 1),
+                'call_ltp':    c_ltp,   'put_ltp':    p_ltp,
+                'call_oi':     c_oi,    'put_oi':     p_oi,
+                'call_iv':     round(c_iv,2), 'put_iv': round(p_iv,2),
+                'call_gamma':  c_g,     'put_gamma':  p_g,
+                'call_vanna':  c_v,     'put_vanna':  p_v,
+                'call_delta':  c_d,     'put_delta':  p_d,
+                'net_gex':     net_gex,
+                'net_vanna':   net_vanna,
+                'net_dex':     net_dex,
+            })
+
+        if not strike_rows:
+            return
+
+        # Store per-strike
+        for r in strike_rows:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO gex_per_strike
+                (trade_date, strike, spot_price, tte_days,
+                 call_ltp, put_ltp, call_oi, put_oi,
+                 call_iv, put_iv, call_gamma, put_gamma,
+                 call_vanna, put_vanna, call_delta, put_delta,
+                 net_gex, net_vanna, net_dex)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (date_str, r['strike'], r['spot'], r['tte_days'],
+                  r['call_ltp'], r['put_ltp'], r['call_oi'], r['put_oi'],
+                  r['call_iv'], r['put_iv'], r['call_gamma'], r['put_gamma'],
+                  r['call_vanna'], r['put_vanna'], r['call_delta'], r['put_delta'],
+                  r['net_gex'], r['net_vanna'], r['net_dex']))
+
+        df2 = pd.DataFrame(strike_rows)
+
+        # Daily aggregate
+        tot_gex   = df2['net_gex'].sum()
+        tot_vanna = df2['net_vanna'].sum()
+        tot_dex   = df2['net_dex'].sum()
+        tot_coi   = df2['call_oi'].sum()
+        tot_poi   = df2['put_oi'].sum()
+        pcr       = tot_poi / max(tot_coi, 1)
+        pos_gex   = df2[df2['net_gex']>0]['net_gex'].sum()
+        neg_gex   = df2[df2['net_gex']<0]['net_gex'].sum()
+        regime    = 'POSITIVE' if tot_gex>0 else ('NEGATIVE' if tot_gex<0 else 'NEUTRAL')
+
+        # Dominant walls
+        pm = df2['net_gex'] > 0
+        nm = df2['net_gex'] < 0
+        dcwall = float(df2[pm].loc[df2[pm]['net_gex'].idxmax(),'strike']) if pm.any() else 0
+        dpwall = float(df2[nm].loc[df2[nm]['net_gex'].idxmin(),'strike']) if nm.any() else 0
+
+        # Flip zone (nearest zero crossing)
+        df_s = df2.sort_values('strike')
+        flip = 0.0
+        for j in range(len(df_s)-1):
+            g1 = float(df_s['net_gex'].iloc[j])
+            g2 = float(df_s['net_gex'].iloc[j+1])
+            if g1 * g2 < 0:
+                k1 = float(df_s['strike'].iloc[j])
+                k2 = float(df_s['strike'].iloc[j+1])
+                f  = k1 + (k2-k1)*abs(g1)/(abs(g1)+abs(g2))
+                if abs(f-spot) < abs(flip-spot) or flip == 0:
+                    flip = f
+
+        # ATM IV
+        atm = atm_strike(spot)
+        atm_row = df2.iloc[(df2['strike']-spot).abs().argsort().iloc[0]]
+        atm_civ = float(atm_row['call_iv'])
+        atm_piv = float(atm_row['put_iv'])
+        iv_skew = atm_piv - atm_civ
+
+        self.conn.execute("""
+            INSERT OR REPLACE INTO gex_daily
+            (trade_date, spot_price, total_net_gex, total_pos_gex, total_neg_gex,
+             total_net_vanna, total_net_dex, gex_regime,
+             dominant_call_wall, dominant_put_wall, gex_flip_zone,
+             atm_call_iv, atm_put_iv, iv_skew, pcr,
+             total_call_oi, total_put_oi, n_strikes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (date_str, spot, tot_gex, pos_gex, neg_gex,
+              tot_vanna, tot_dex, regime, dcwall, dpwall, flip,
+              atm_civ, atm_piv, iv_skew, pcr,
+              tot_coi, tot_poi, len(df2)))
         self.conn.commit()
-        fl=gamma_flip_zones(df2,spot); vz=vanna_flip_zones(df2,spot)
-        ivi=iv_trend(df2); cas=gex_cascade(df2,spot,cfg,vz,ivi['regime'])
-        tg=df2['net_gex'].sum(); pg=df2[df2['net_gex']>0]['net_gex'].sum()
-        ng=df2[df2['net_gex']<0]['net_gex'].sum()
-        tv=df2['net_vanna'].sum(); td_=df2['net_dex'].sum()
-        tc=df2['call_oi'].sum(); tp=df2['put_oi'].sum(); pcr=tp/max(tc,1)
-        mp=float(df2.groupby('strike_price')['oi_total'].sum().idxmax()) if not df2.empty else 0
-        pm=df2['net_gex']>0; nm=df2['net_gex']<0
-        dc=float(df2[pm].loc[df2[pm]['net_gex'].idxmax(),'strike_price']) if pm.any() else 0
-        dp=float(df2[nm].loc[df2[nm]['net_gex'].idxmin(),'strike_price']) if nm.any() else 0
-        fs=sorted(fl,key=lambda z:abs(z['strike']-spot))
-        f1=fs[0]['strike'] if fs else 0; f2=fs[1]['strike'] if len(fs)>1 else 0
-        ar_=df2.iloc[(df2['strike_price']-spot).abs().argsort().iloc[0]]
-        vr=[z['role'] for z in vz]
-        ab=[z for z in vz if z['above']]; bl=[z for z in vz if not z['above']]
-        def mnz(lst,role): return min([z['strike'] for z in lst if z['role']==role],key=lambda k:abs(k-spot),default=0)
-        nva=mnz(ab,'VACUUM_ZONE'); nsu=mnz(bl,'SUPPORT_FLOOR'); ntr=mnz(bl,'TRAP_DOOR')
-        bear=cas.get('BEAR',{}); bull=cas.get('BULL',{})
-        gb='POSITIVE' if tg>0 else('NEGATIVE' if tg<0 else 'NEUTRAL')
-        vb='BULLISH_IV' if tv>0 else('BEARISH_IV' if tv<0 else 'NEUTRAL')
-        db='LONG_DELTA' if td_>0 else('SHORT_DELTA' if td_<0 else 'NEUTRAL')
-        cb='BEAR' if bear.get('net',0)>bull.get('net',0) else('BULL' if bull.get('net',0)>bear.get('net',0) else 'NEUTRAL')
-        self.conn.execute("""INSERT OR REPLACE INTO gex_daily_summary
-            (trade_date,symbol,spot_price,net_gex_total,net_gex_positive,net_gex_negative,
-             gex_ratio,gex_regime,net_vanna_total,net_vanna_positive,net_vanna_negative,vanna_regime,
-             net_dex_total,dex_regime,gex_flip_zone_1,gex_flip_zone_2,n_flip_zones,
-             dominant_call_wall,dominant_put_wall,max_pain_strike,total_call_oi,total_put_oi,
-             pcr,total_oi,atm_call_iv,atm_put_iv,iv_skew,iv_regime,avg_call_iv,avg_put_iv,
-             bear_cascade_fuel,bear_cascade_absorption,bear_cascade_net,bull_cascade_fuel,
-             bull_cascade_absorption,bull_cascade_net,cascade_bias,n_vanna_zones,n_vacuum_zones,
-             n_resistance_ceilings,n_trap_doors,n_support_floors,nearest_vacuum_above,
-             nearest_support_below,nearest_trap_below,n_strikes,n_expiries)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (ds,sym,spot,tg,pg,ng,pg/abs(ng) if ng else 0,gb,
-             tv,df2[df2['net_vanna']>0]['net_vanna'].sum(),df2[df2['net_vanna']<0]['net_vanna'].sum(),vb,
-             td_,db,f1,f2,len(fl),dc,dp,mp,tc,tp,pcr,tc+tp,
-             float(ar_['call_iv']),float(ar_['put_iv']),ivi['skew'],ivi['regime'],
-             df2['call_iv'].replace(0,np.nan).mean() or 0,df2['put_iv'].replace(0,np.nan).mean() or 0,
-             bear.get('fuel',0),bear.get('absorption',0),bear.get('net',0),
-             bull.get('fuel',0),bull.get('absorption',0),bull.get('net',0),cb,
-             len(vz),vr.count('VACUUM_ZONE'),vr.count('RESISTANCE_CEILING'),
-             vr.count('TRAP_DOOR'),vr.count('SUPPORT_FLOOR'),nva,nsu,ntr,len(df2),df2['expiry'].nunique()))
-        self.conn.commit()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    def export(self, progress_cb=None) -> dict:
+        """Export all tables to CSV."""
+        paths = {}
+        tables = {
+            'GEX_DAILY.csv':      'SELECT * FROM gex_daily ORDER BY trade_date',
+            'GEX_PER_STRIKE.csv': 'SELECT * FROM gex_per_strike ORDER BY trade_date, strike',
+            'NIFTY_OHLCV.csv':    'SELECT * FROM nifty_ohlcv ORDER BY trade_date',
+            'OPTIONS_RAW.csv':    'SELECT * FROM options_raw ORDER BY trade_date, strike, option_type',
+        }
+        total = len(tables)
+        for i, (fname, sql) in enumerate(tables.items()):
+            if progress_cb:
+                progress_cb(i/total, f"Exporting {fname}...")
+            try:
+                df = pd.read_sql(sql, self.conn)
+                path = EXPORT_DIR / fname
+                df.to_csv(path, index=False)
+                paths[fname] = path
+                log.info(f"  {fname}: {len(df):,} rows")
+            except Exception as e:
+                log.error(f"  Export {fname}: {e}")
+        if progress_cb:
+            progress_cb(1.0, "Export complete")
+        return paths
+
+    def summary(self) -> dict:
+        """Return DB row counts for display."""
+        s = {}
+        for t in ['nifty_ohlcv','options_raw','gex_per_strike','gex_daily','fetch_log']:
+            try:
+                s[t] = self.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            except Exception:
+                s[t] = 0
+        try:
+            r = self.conn.execute(
+                "SELECT MIN(trade_date),MAX(trade_date) FROM gex_daily").fetchone()
+            s['gex_from'] = r[0] or '—'
+            s['gex_to']   = r[1] or '—'
+        except Exception:
+            s['gex_from'] = s['gex_to'] = '—'
+        try:
+            fl = self.conn.execute(
+                "SELECT status,COUNT(*) FROM fetch_log GROUP BY status").fetchall()
+            s['fetch_status'] = dict(fl)
+        except Exception:
+            s['fetch_status'] = {}
+        return s
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RETURN VARIABLES
-# ═══════════════════════════════════════════════════════════════════════════════
-def compute_returns(conn,progress_cb=None):
-    log.info("Computing return variables...")
-    for i,sym in enumerate(SYMBOLS):
-        if progress_cb: progress_cb(i/len(SYMBOLS),f"Returns: {sym}")
-        # Prefer OHLCV (has real H/L for intraday range)
-        orows=conn.execute("SELECT trade_date,open,high,low,close FROM index_ohlcv WHERE symbol=? ORDER BY trade_date",(sym,)).fetchall()
-        if orows:
-            df=pd.DataFrame(orows,columns=['trade_date','open','high','low','close'])
-        else:
-            brows=conn.execute("SELECT trade_date,AVG(underlying_value) as close FROM bhavcopy_raw WHERE symbol=? AND underlying_value>0 GROUP BY trade_date ORDER BY trade_date",(sym,)).fetchall()
-            if not brows: continue
-            df=pd.DataFrame(brows,columns=['trade_date','close'])
-            df['open']=df['close']; df['high']=df['close']; df['low']=df['close']
-        df=df.sort_values('trade_date').reset_index(drop=True)
-        df['lr']=np.log(df['close']/df['close'].shift(1))
-        df['r1']=df['close'].pct_change(1).shift(-1)*100
-        df['r3']=df['close'].pct_change(3).shift(-3)*100
-        df['r5']=df['close'].pct_change(5).shift(-5)*100
-        df['rv5']=df['lr'].rolling(5).std()*np.sqrt(252)*100
-        df['rv21']=df['lr'].rolling(21).std()*np.sqrt(252)*100
-        df['idr']=(df['high']-df['low'])/df['low'].replace(0,np.nan)*100
-        def s(v): return float(v) if pd.notna(v) and not np.isinf(v) else None
-        for _,row in df.iterrows():
-            conn.execute("""UPDATE gex_daily_summary SET
-                index_return_1d=?,index_return_3d=?,index_return_5d=?,
-                index_intraday_range=?,realized_vol_5d=?,realized_vol_21d=?
-                WHERE trade_date=? AND symbol=?""",
-                (s(row['r1']),s(row['r3']),s(row['r5']),s(row['idr']),s(row['rv5']),s(row['rv21']),row['trade_date'],sym))
-        conn.commit(); log.info(f"  {sym}: {len(df)} days")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-def export_all(conn,progress_cb=None):
-    log.info(f"Exporting to {EXPORT_DIR}/")
-    steps=6; done=0
-    def tick(msg):
-        nonlocal done; done+=1
-        if progress_cb: progress_cb(done/steps,msg)
-        log.info(f"  {msg}")
-
-    gex=pd.read_sql("SELECT * FROM gex_daily_summary ORDER BY symbol,trade_date",conn)
-    gex.to_csv(EXPORT_DIR/'GEX_MAIN_DATASET.csv',index=False)
-    tick(f"GEX_MAIN_DATASET.csv — {len(gex):,} rows")
-
-    ohlcv=pd.read_sql("SELECT * FROM index_ohlcv ORDER BY symbol,trade_date",conn)
-    ohlcv.to_csv(EXPORT_DIR/'OHLCV_ALL.csv',index=False)
-    tick(f"OHLCV_ALL.csv — {len(ohlcv):,} rows")
-
-    for sym in SYMBOLS:
-        o=ohlcv[ohlcv['symbol']==sym]
-        if not o.empty: o.to_csv(EXPORT_DIR/f'OHLCV_{sym}.csv',index=False)
-    tick("Per-symbol OHLCV CSVs")
-
-    for sym in SYMBOLS:
-        g=gex[gex['symbol']==sym]
-        if not g.empty: g.to_csv(EXPORT_DIR/f'GEX_{sym}.csv',index=False)
-    tick("Per-symbol GEX CSVs")
-
-    ps=pd.read_sql("SELECT * FROM gex_per_strike ORDER BY trade_date,symbol,strike_price",conn)
-    ps.to_csv(EXPORT_DIR/'GEX_PER_STRIKE.csv',index=False)
-    tick(f"GEX_PER_STRIKE.csv — {len(ps):,} rows")
-
-    # MASTER: GEX + OHLCV merged
-    master=pd.merge(gex,ohlcv[['trade_date','symbol','open','high','low','close','volume','change_pct']],
-                    on=['trade_date','symbol'],how='left')
-    master.to_csv(EXPORT_DIR/'MASTER_DATASET.csv',index=False)
-    tick(f"MASTER_DATASET.csv — {len(master):,} rows  <- USE FOR REGRESSION")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SUMMARY
-# ═══════════════════════════════════════════════════════════════════════════════
-def summary(conn):
-    print("\n"+"="*65)
-    print("NYZTRADE RESEARCH DATABASE")
-    print("="*65)
-    for t,d in [('bhavcopy_raw','Options OI raw'),('index_ohlcv','Index OHLCV'),
-                ('gex_per_strike','GEX per strike'),('gex_daily_summary','Daily GEX summary')]:
-        n=conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-        print(f"  {t:<25} {n:>10,}  {d}")
-    print()
-    for sym in SYMBOLS:
-        g=conn.execute("SELECT MIN(trade_date),MAX(trade_date),COUNT(*) FROM gex_daily_summary WHERE symbol=?",(sym,)).fetchone()
-        o=conn.execute("SELECT COUNT(*) FROM index_ohlcv WHERE symbol=?",(sym,)).fetchone()
-        gstr=f"GEX {g[0]}→{g[1]} ({g[2]} days)" if g and g[0] else "GEX: none"
-        print(f"  {sym:<12}: {gstr}  |  OHLCV: {o[0]} days")
-    dl=conn.execute("SELECT status,COUNT(*) FROM download_log GROUP BY status").fetchall()
-    print(f"\n  Downloads: {dict(dl)}")
-    print(f"\n  Export files in {EXPORT_DIR}/:")
-    for f in sorted(EXPORT_DIR.glob('*.csv')):
-        print(f"    {f.name:<35} {f.stat().st_size/1024**2:.1f} MB")
-    print("="*65)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── CLI entry point ────────────────────────────────────────────────────────────
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--download',action='store_true')
-    ap.add_argument('--ohlcv',action='store_true')
-    ap.add_argument('--compute',action='store_true')
-    ap.add_argument('--returns',action='store_true')
-    ap.add_argument('--export',action='store_true')
-    ap.add_argument('--summary',action='store_true')
-    ap.add_argument('--all',action='store_true')
-    ap.add_argument('--start',default='2019-01-01')
-    ap.add_argument('--end',default=str(date.today()))
-    args=ap.parse_args()
-    conn=init_db(); s=date.fromisoformat(args.start); e=date.fromisoformat(args.end)
-    if args.all or args.download: BhavCopyDownloader(conn).download_range(s,e)
-    if args.all or args.ohlcv:   OHLCVDownloader(conn).download_range(s,e)
-    if args.all or args.compute:  GEXEngine(conn).compute_all()
-    if args.all or args.returns:  compute_returns(conn)
-    if args.all or args.export:   export_all(conn)
-    if args.summary or args.all:  summary(conn)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--client-id',  required=True)
+    ap.add_argument('--token',      required=True)
+    ap.add_argument('--start',      default='2024-01-01')
+    ap.add_argument('--end',        default=str(date.today()))
+    ap.add_argument('--prices',     action='store_true')
+    ap.add_argument('--options',    action='store_true')
+    ap.add_argument('--gex',        action='store_true')
+    ap.add_argument('--export',     action='store_true')
+    ap.add_argument('--all',        action='store_true')
+    args = ap.parse_args()
+
+    conn   = init_db()
+    client = DhanClient(args.client_id, args.token)
+    gc     = GEXCollector(conn, client)
+    start  = date.fromisoformat(args.start)
+    end    = date.fromisoformat(args.end)
+
+    if args.all or args.prices:
+        gc.fetch_nifty_prices(start, end)
+    if args.all or args.options:
+        gc.fetch_options_data(start, end)
+    if args.all or args.gex:
+        gc.compute_gex()
+    if args.all or args.export:
+        gc.export()
+
+    s = gc.summary()
+    print("\n=== DB Summary ===")
+    for k, v in s.items():
+        print(f"  {k}: {v}")
     conn.close()
 
-if __name__=='__main__': main()
+
+if __name__ == '__main__':
+    main()
