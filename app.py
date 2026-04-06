@@ -412,14 +412,25 @@ with t2:
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
-        if st.button("🔁 Retry Failed Dates",
-                     use_container_width=True,
-                     help="Clears 'error' status so failed dates are retried on next download"):
-            c2 = col.init_db()
-            c2.execute("DELETE FROM download_log WHERE status='error'")
-            c2.commit(); c2.close()
-            st.success("Cleared error status. Click Download Bhavcopy to retry failed dates.")
-            st.rerun()
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            if st.button("🔁 Retry Failed Dates",
+                         use_container_width=True,
+                         help="Clears error status — retries on next download run"):
+                c2 = col.init_db()
+                c2.execute("DELETE FROM download_log WHERE status='error'")
+                c2.commit(); c2.close()
+                st.success("Cleared. Click Download Bhavcopy to retry.")
+                st.rerun()
+        with col_r2:
+            if st.button("🏖 Skip Errors (mark as holiday)",
+                         use_container_width=True,
+                         help="If 1-2 dates keep failing, NSE has no file for them — safe to skip"):
+                c2 = col.init_db()
+                c2.execute("UPDATE download_log SET status='holiday' WHERE status='error'")
+                c2.commit(); c2.close()
+                st.success("Marked as holidays. These dates will be permanently skipped.")
+                st.rerun()
     with cb:
         # Show recent log
         failed = qry("SELECT trade_date,error_msg FROM download_log WHERE status='error' LIMIT 10")
