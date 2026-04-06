@@ -42,25 +42,48 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 # ── Logging ────────────────────────────────────────────────────────────────────
+# Safe logging — FileHandler may fail on read-only Cloud filesystem
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    _log_handlers.insert(0, logging.FileHandler('nyztrade_gex_research.log'))
+except Exception:
+    pass  # Can't write log file — stdout only
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler('nyztrade_gex_research.log'),
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers=_log_handlers
 )
 log = logging.getLogger('NYZTrade')
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DB_PATH         = Path('nyztrade_research.db')
-RAW_DIR         = Path('bhavcopy_cache')
-OHLCV_DIR       = Path('ohlcv_cache')
-EXPORT_DIR      = Path('research_export')
-CHECKPOINT_FILE = Path('nyztrade_checkpoint.json')
+# ── Work directory — safe on Streamlit Cloud (read-only filesystem) ──────────────
+def _safe_workdir():
+    """Find a writable directory. Current dir first, /tmp fallback."""
+    for base in [Path('.'), Path('/tmp/nyztrade_research')]:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            test = base / '.write_test'
+            test.write_text('ok')
+            test.unlink()
+            return base
+        except Exception:
+            continue
+    return Path('/tmp')
 
-for d in [RAW_DIR, OHLCV_DIR, EXPORT_DIR]:
-    d.mkdir(exist_ok=True)
+_WORK = _safe_workdir()
+
+DB_PATH         = _WORK / 'nyztrade_research.db'
+RAW_DIR         = _WORK / 'bhavcopy_cache'
+OHLCV_DIR       = _WORK / 'ohlcv_cache'
+EXPORT_DIR      = _WORK / 'research_export'
+CHECKPOINT_FILE = _WORK / 'nyztrade_checkpoint.json'
+
+# Safe mkdir — never crashes on import even on read-only filesystems
+for _d in [RAW_DIR, OHLCV_DIR, EXPORT_DIR]:
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 # ── Symbols ────────────────────────────────────────────────────────────────────
 SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
