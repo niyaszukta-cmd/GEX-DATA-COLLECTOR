@@ -12,21 +12,39 @@ st.set_page_config(
 
 try:
     import sys
+    import importlib
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
+
+    # Force reload — prevents "partial module" caching on Streamlit Cloud
+    if 'gex_dhan_collector' in sys.modules:
+        importlib.reload(sys.modules['gex_dhan_collector'])
     import gex_dhan_collector as gc
+    # Verify key attributes loaded
+    _ = gc.ATM_RANGE
+    _ = gc.init_db
     READY = True
+    ERR   = ''
 except Exception as e:
+    import traceback
     READY = False
-    ERR   = str(e)
+    ERR   = traceback.format_exc()
 
 import pandas as pd
 import time
 from datetime import date, timedelta
 
 if not READY:
-    st.error(f"❌ Import failed: {ERR}")
-    st.code("Make sure gex_dhan_collector.py is in the same repo folder.")
+    st.error("❌ Could not load gex_dhan_collector.py")
+    st.markdown("""
+    **Required repo structure:**
+    ```
+    app.py
+    gex_dhan_collector.py
+    requirements.txt
+    ```
+    """)
+    st.code(ERR, language='python')
     st.stop()
 
 for k, v in [('running',False),('prog',0.0),('msg',''),('done',''),('err','')]:
@@ -128,9 +146,9 @@ with st.sidebar:
                                max_value=date.today(), key="ed")
 
     st.divider()
-    st.caption(f"Strikes: ATM ±{gc.ATM_RANGE} (step ₹{gc.STRIKE_INTERVAL})")
-    st.caption(f"Total per day: {gc.ATM_RANGE*2+1} strikes × 2 = {(gc.ATM_RANGE*2+1)*2} calls")
-    st.caption(f"Lot size: {gc.LOT_SIZE}  |  r: {gc.RISK_FREE*100:.1f}%")
+    st.caption(f"Strikes: ATM ±15 (step ₹{50})")
+    st.caption(f"Total per day: {31} strikes × 2 = {(31)*2} calls")
+    st.caption(f"Lot size: {75}  |  r: {6.5}%")
 
     st.divider()
     if st.button("🔄 Reset", use_container_width=True):
@@ -183,7 +201,7 @@ with t1:
     st.markdown("### Run Complete Pipeline")
 
     days_est = (end_d - start_d).days * 5 // 7
-    calls_est = days_est * (gc.ATM_RANGE*2+1) * 2
+    calls_est = days_est * (31) * 2
     mins_est  = calls_est // 600
 
     st.info(f"""
@@ -235,25 +253,17 @@ with t2:
 with t3:
     st.markdown("### Step 2 — Options LTP + OI")
     st.info(
-        f"For each day, fetches LTP and OI for **{(gc.ATM_RANGE*2+1)*2} contracts** "
+        f"For each day, fetches LTP and OI for **{(31)*2} contracts** "
         "(ATM±15 × CE+PE). Uses Dhan security ID lookup per contract."
     )
 
-    fl = qry("SELECT status, COUNT(*) FROM fetch_log GROUP BY status")
-    if fl:
-        fld = dict(fl)
-        ca, cb, cc = st.columns(3)
-        ca.metric("Fetched",  fld.get('ok', 0))
-        cb.metric("No Data",  fld.get('no_data', 0))
-        cc.metric("Errors",   fld.get('error', 0))
-
-        nifty_n = qry("SELECT COUNT(*) FROM nifty_ohlcv", one=True)
-        n = nifty_n[0] if nifty_n else 0
-        expected = n * (gc.ATM_RANGE*2+1) * 2
-        done_n = fld.get('ok',0) + fld.get('no_data',0)
-        if expected > 0:
-            st.progress(min(done_n/expected, 1.0),
-                        f"{done_n:,} / {expected:,} ({done_n*100//expected}%)")
+    el = qry("SELECT status, COUNT(*) FROM expiry_log GROUP BY status")
+    eld = dict(el) if el else {}
+    ca, cb, cc = st.columns(3)
+    ca.metric("Expiries done", eld.get('ok', 0))
+    cb.metric("Expiry errors", eld.get('error', 0))
+    opt_n = qry("SELECT COUNT(*) FROM options_raw", one=True)
+    cc.metric("Option rows stored", f"{opt_n[0]:,}" if opt_n else "0")
 
     if st.button("📥 Fetch Options Data", type="primary"):
         run(lambda c: c.fetch_options_data(start_d, end_d, prog))
@@ -348,7 +358,8 @@ with t5:
         st.session_state['done'] = "Export complete!"
 
     try:
-        csvs = sorted(gc.EXPORT_DIR.glob('*.csv')) if gc.EXPORT_DIR.exists() else []
+        export_dir = gc.EXPORT_DIR
+        csvs = sorted(export_dir.glob('*.csv')) if export_dir.exists() else []
     except Exception:
         csvs = []
 
@@ -373,4 +384,4 @@ st.divider()
 ca, cb, cc = st.columns(3)
 ca.caption("NYZTrade Analytics | Dr. Niyas N")
 cb.caption("Dhan API | NIFTY ATM ±15 | BS Greeks")
-cc.caption(f"DB: {gc.DB_PATH}")
+cc.caption(f"DB: {gc.DB_PATH}") if READY else cc.caption("DB: gex_dhan.db")
