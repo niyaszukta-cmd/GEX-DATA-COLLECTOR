@@ -232,59 +232,110 @@ def qry(sql, params=(), fetchall=True):
         return [] if fetchall else None
 
 
-# ── yfinance OHLCV downloader (works on Streamlit Cloud) ─────────────────────────
-def _download_ohlcv_yfinance(conn, start_d, end_d, prog_cb=None):
+# ── Dhan API OHLCV downloader ─────────────────────────────────────────────────────
+# Uses Dhan /v2/charts/historical — reliable, works from any server, free with account
+
+DHAN_BASE  = "https://api.dhan.co"
+
+# Dhan security IDs for NSE indices
+DHAN_INDEX = {
+    "NIFTY":      {"securityId": "13",  "exchangeSegment": "IDX_I"},
+    "BANKNIFTY":  {"securityId": "25",  "exchangeSegment": "IDX_I"},
+    "FINNIFTY":   {"securityId": "27",  "exchangeSegment": "IDX_I"},
+    "MIDCPNIFTY": {"securityId": "442", "exchangeSegment": "IDX_I"},
+}
+
+def _get_dhan_token():
+    """Read Dhan token from Streamlit secrets or session state."""
     try:
-        import yfinance as yf
-    except ImportError:
-        if prog_cb: prog_cb(0, "Install yfinance: add to requirements.txt")
+        return st.secrets.get("DHAN_ACCESS_TOKEN", "")
+    except Exception:
+        return st.session_state.get("dhan_token", "")
+
+def _download_ohlcv_dhan(conn, start_d, end_d, prog_cb=None):
+    """
+    Download index OHLCV from Dhan API /v2/charts/historical.
+    Chunks into 365-day windows (Dhan limit).
+    Works from any server including Streamlit Cloud.
+    """
+    import requests as req_lib
+    from datetime import timedelta
+
+    token = _get_dhan_token()
+    if not token:
+        if prog_cb: prog_cb(0, "No Dhan token — enter it in the sidebar")
         return
 
-    YF_MAP = {
-        "NIFTY":      "^NSEI",
-        "BANKNIFTY":  "^NSEBANK",
-        "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
-        "MIDCPNIFTY": "NIFTY_MIDCAP_SELECT.NS",
+    headers = {
+        "access-token": token,
+        "Content-Type": "application/json",
     }
+
     symbols = col.SYMBOLS
-    for i, sym in enumerate(symbols):
-        ticker = YF_MAP.get(sym)
-        if not ticker: continue
-        if prog_cb: prog_cb(i/len(symbols), f"Downloading {sym} OHLCV via Yahoo Finance...")
-        try:
-            df = yf.download(ticker,
-                             start=start_d.strftime("%Y-%m-%d"),
-                             end=end_d.strftime("%Y-%m-%d"),
-                             auto_adjust=True, progress=False)
-            if df.empty: continue
-            df = df.reset_index()
-            # Flatten MultiIndex columns if present
-            if hasattr(df.columns, "levels"):
-                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df.columns = [str(c).strip() for c in df.columns]
-            rows = []
-            for _, row in df.iterrows():
-                try:
-                    td  = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
-                    o   = float(row.get("Open",  0) or 0)
-                    h   = float(row.get("High",  0) or 0)
-                    l   = float(row.get("Low",   0) or 0)
-                    cl  = float(row.get("Close", 0) or 0)
-                    v   = float(row.get("Volume",0) or 0)
-                    chg = ((cl - o) / o * 100) if o > 0 else 0
-                    rows.append((td, sym, o, h, l, cl, v, round(chg, 4)))
-                except Exception:
-                    continue
-            if rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO index_ohlcv "
-                    "(trade_date,symbol,open,high,low,close,volume,change_pct) "
-                    "VALUES(?,?,?,?,?,?,?,?)", rows)
-                conn.commit()
-                if prog_cb: prog_cb((i+0.9)/len(symbols), f"{sym}: {len(rows)} rows saved")
-        except Exception as e:
-            if prog_cb: prog_cb(i/len(symbols), f"{sym} error: {e}")
-    if prog_cb: prog_cb(1.0, "OHLCV complete")
+    for si, sym in enumerate(symbols):
+        cfg = DHAN_INDEX.get(sym)
+        if not cfg:
+            continue
+        if prog_cb: prog_cb(si/len(symbols), f"Dhan OHLCV: {sym}...")
+
+        # Chunk into 365-day windows
+        all_rows = []
+        chunk_start = start_d
+        while chunk_start <= end_d:
+            chunk_end = min(chunk_start + timedelta(days=364), end_d)
+            payload = {
+                "securityId":      cfg["securityId"],
+                "exchangeSegment": cfg["exchangeSegment"],
+                "instrument":      "INDEX",
+                "expiryCode":      0,
+                "oi_flag":         "0",
+                "fromDate":        chunk_start.strftime("%Y-%m-%d"),
+                "toDate":          chunk_end.strftime("%Y-%m-%d"),
+            }
+            try:
+                r = req_lib.post(
+                    f"{DHAN_BASE}/v2/charts/historical",
+                    headers=headers, json=payload, timeout=30)
+                if r.status_code == 200:
+                    data = r.json()
+                    timestamps = data.get("timestamp", [])
+                    opens      = data.get("open",      [])
+                    highs      = data.get("high",      [])
+                    lows       = data.get("low",       [])
+                    closes     = data.get("close",     [])
+                    volumes    = data.get("volume",    [])
+                    for j, ts in enumerate(timestamps):
+                        try:
+                            from datetime import datetime as dt
+                            td  = dt.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+                            o   = float(opens[j])   if j < len(opens)   else 0
+                            h   = float(highs[j])   if j < len(highs)   else 0
+                            l   = float(lows[j])    if j < len(lows)    else 0
+                            cl  = float(closes[j])  if j < len(closes)  else 0
+                            v   = float(volumes[j]) if j < len(volumes) else 0
+                            chg = ((cl - o) / o * 100) if o > 0 else 0
+                            all_rows.append((td, sym, o, h, l, cl, v, round(chg, 4)))
+                        except Exception:
+                            continue
+                else:
+                    if prog_cb: prog_cb(si/len(symbols),
+                        f"{sym} {chunk_start}: HTTP {r.status_code}")
+            except Exception as e:
+                if prog_cb: prog_cb(si/len(symbols), f"{sym} error: {e}")
+
+            chunk_start = chunk_end + timedelta(days=1)
+            time.sleep(0.5)  # gentle rate limit
+
+        if all_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO index_ohlcv "
+                "(trade_date,symbol,open,high,low,close,volume,change_pct) "
+                "VALUES(?,?,?,?,?,?,?,?)", all_rows)
+            conn.commit()
+            if prog_cb: prog_cb((si+1)/len(symbols),
+                f"{sym}: {len(all_rows)} OHLCV rows saved")
+
+    if prog_cb: prog_cb(1.0, "Dhan OHLCV download complete")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -310,6 +361,21 @@ with st.sidebar:
 
     st.markdown("**📌 Indices**")
     sel_syms = st.multiselect("", col.SYMBOLS, default=col.SYMBOLS)
+
+    st.divider()
+    st.markdown("**🔑 Dhan API Token**")
+    dhan_tok = st.text_input(
+        "Access Token",
+        value=st.session_state.get("dhan_token", ""),
+        type="password",
+        help="Required for OHLCV download. Get from Dhan → API → Access Token",
+        key="dhan_token_input"
+    )
+    if dhan_tok:
+        st.session_state["dhan_token"] = dhan_tok
+        st.caption("✅ Token saved for this session")
+    else:
+        st.caption("⚠️ Enter token to enable OHLCV download")
 
     st.divider()
     st.markdown("**🛡️ Safety**")
@@ -551,10 +617,10 @@ with t3:
     st.divider()
     ca, cb = st.columns(2)
     with ca:
-        if st.button("📥 Download OHLCV (Yahoo Finance)", type="primary",
+        if st.button("📥 Download OHLCV (Dhan API)", type="primary",
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
-            def _yf_dl(c): _download_ohlcv_yfinance(c, start_d, end_d, prog_cb)
+            def _yf_dl(c): _download_ohlcv_dhan(c, start_d, end_d, prog_cb)
             run_sync(_yf_dl, _p, _t)
             st.session_state["step_done"] = "OHLCV download complete!"
     with cb:
