@@ -1,5 +1,38 @@
-pandas>=1.5.0
-numpy>=1.23.0
-scipy>=1.9.0
-requests>=2.28.0
-streamlit>=1.28.0
+# ============================================================================
+# NYZTrade Analytics — requirements.txt
+# Covers:
+#   · nyztrade_unified_dashboard.py
+#   · nyztrade_nifty_historical_downloader_v2.py
+#
+# Python: 3.10 / 3.11 / 3.12  (recommended: 3.11)
+# Install: pip install -r requirements.txt
+# Streamlit Cloud: place this file in repo root alongside your .py file
+# ============================================================================
+
+# ── Core web framework ───────────────────────────────────────────────────────
+streamlit>=1.44.0
+
+# ── Data manipulation ────────────────────────────────────────────────────────
+pandas>=2.2.0
+numpy>=1.26.0
+
+# ── Charting ─────────────────────────────────────────────────────────────────
+plotly>=5.24.0
+
+# ── Mathematics / Statistics (Black-Scholes norm.pdf / norm.cdf) ─────────────
+scipy>=1.13.0
+
+# ── HTTP client (Dhan API calls) ─────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Timezone handling (IST / UTC) ────────────────────────────────────────────
+pytz>=2024.1
+
+# ── TOTP auto-token generation (optional — only for Dhan TOTP auto-login) ────
+pyotp>=2.8.0
+
+# ============================================================================
+# STDLIB — already in Python, no install needed:
+#   dataclasses · datetime · hashlib · io · json · os
+#   pathlib · pickle · sqlite3 · time · typing · warnings
+# ============================================================================
