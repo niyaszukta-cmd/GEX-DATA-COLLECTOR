@@ -299,7 +299,7 @@ _header_txt  = st.empty()
 
 if st.session_state.get('step_done'):
     st.success(st.session_state['step_done'])
-    st.session_state['step_done'] = ''
+    # Don't clear — keep showing until user navigates
 
 if st.session_state.get('error'):
     st.error(f"❌ {st.session_state['error'][:500]}")
@@ -381,7 +381,7 @@ with t1:
             col.compute_returns(c, prog_cb)
             col.export_all(c, prog_cb)
         run_sync(_all, _header_prog, _header_txt)
-        st.rerun()
+        st.session_state["step_done"] = "✅ Done! Refresh page to see updated stats."
 
     st.caption("💡 **Tip:** Start before sleeping. Typical run time: 3–4 hours for 7 years of data.")
 
@@ -411,7 +411,7 @@ with t2:
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
-            st.rerun()
+            st.session_state['step_done'] = '✅ Bhavcopy download complete!'
         col_r1, col_r2 = st.columns(2)
         with col_r1:
             if st.button("🔁 Retry Failed Dates",
@@ -500,13 +500,13 @@ with t3:
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
-            st.rerun()
+            st.session_state['step_done'] = '✅ OHLCV download complete! Stats updated below.'
     with cb:
         if st.button("📐 Compute Returns from OHLCV",
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
-            st.rerun()
+            st.session_state['step_done'] = '✅ Return variables computed!'
 
 
     # Preview
@@ -557,13 +557,13 @@ with t4:
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.GEXEngine(c).compute_all(prog_cb), _p, _t)
-            st.rerun()
+            st.session_state['step_done'] = '✅ GEX computation complete!'
     with cb:
         if st.button("📐 Step 4: Compute Returns",
                      use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
-            st.rerun()
+            st.session_state['step_done'] = '✅ Return variables computed!'
 
     if st.session_state['running']:
         st.progress(st.session_state['prog'], st.session_state['prog_msg'])
@@ -621,7 +621,7 @@ with t5:
                  use_container_width=False):
         _p = st.empty(); _t = st.empty()
         run_sync(lambda c: col.export_all(c, prog_cb), _p, _t)
-        st.rerun()
+        st.session_state['step_done'] = '✅ Export complete! Download files below.'
 
     if st.session_state['running']:
         st.progress(st.session_state['prog'], st.session_state['prog_msg'])
