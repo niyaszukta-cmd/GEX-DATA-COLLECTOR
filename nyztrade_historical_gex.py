@@ -552,10 +552,15 @@ class GEXEngine:
         return 7/365
 
     def _pending(self):
+        # Remove underlying_value>0 filter — spot now comes from OHLCV fallback
+        # so ALL dates with bhavcopy data are eligible, even if underlying_value=0
         return self.conn.execute("""
-            SELECT DISTINCT b.trade_date,b.symbol FROM bhavcopy_raw b
-            LEFT JOIN gex_daily_summary g ON b.trade_date=g.trade_date AND b.symbol=g.symbol
-            WHERE g.trade_date IS NULL AND b.underlying_value>0 ORDER BY b.trade_date,b.symbol
+            SELECT DISTINCT b.trade_date, b.symbol
+            FROM bhavcopy_raw b
+            LEFT JOIN gex_daily_summary g
+                ON b.trade_date = g.trade_date AND b.symbol = g.symbol
+            WHERE g.trade_date IS NULL
+            ORDER BY b.trade_date, b.symbol
         """).fetchall()
 
     def compute_all(self,progress_cb=None):
@@ -577,8 +582,31 @@ class GEXEngine:
         if not rows: return
         df=pd.DataFrame(rows,columns=['expiry','opt','strike','oi','oic','ltp','set','und'])
         df['price']=df.apply(lambda r:r['set'] if r['ltp']==0 else r['ltp'],axis=1)
-        spot=float(df['und'].replace(0,np.nan).dropna().iloc[0]) if df['und'].replace(0,np.nan).dropna().any() else 0
-        if spot<=0: return
+        # Try underlying_value from bhavcopy first
+        und_vals = df['und'].replace(0, np.nan).dropna()
+        spot = float(und_vals.iloc[0]) if len(und_vals) > 0 else 0
+
+        # Fallback: use OHLCV close price (Dhan API data — exchange grade)
+        # This handles 2019-2023 dates where NSE Bhavcopy had underlying_value=0
+        if spot <= 0:
+            ohlcv_row = self.conn.execute(
+                "SELECT close FROM index_ohlcv WHERE trade_date=? AND symbol=? LIMIT 1",
+                (ds, sym)
+            ).fetchone()
+            if ohlcv_row and ohlcv_row[0] and float(ohlcv_row[0]) > 0:
+                spot = float(ohlcv_row[0])
+
+        # Final fallback: derive from ATM strike (put-call parity approximation)
+        if spot <= 0:
+            # ATM strike is approximately equal to spot — use median strike
+            # of options with highest OI as rough spot proxy
+            top_oi = df.nlargest(10, 'oi')
+            if not top_oi.empty:
+                spot = float(top_oi['strike'].median())
+
+        if spot <= 0:
+            log.warning(f"  No spot price for {ds} {sym} — skipping")
+            return
         ar=[]
         for exp in df['expiry'].unique():
             tte=self._tte(ds,exp); de=df[df['expiry']==exp]
