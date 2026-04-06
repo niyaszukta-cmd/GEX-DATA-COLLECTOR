@@ -420,19 +420,21 @@ with t2:
         "SELECT trade_date FROM download_log WHERE status='error' LIMIT 1",
         fetchall=False)
     if dl_dict.get('error', 0) > 0:
-        with st.expander(f"⚠️ {dl_dict.get('error',0)} errors — likely new NSE column format"):
+        with st.expander(f"⚠️ {dl_dict.get('error',0)} errors — click to fix"):
             st.markdown("""
-            **Common cause:** NSE updated their Bhavcopy column names in 2024+.
-            The latest `nyztrade_historical_gex.py` handles all known formats.
-            Make sure you have the latest version of the file in your GitHub repo.
+**Root cause:** NSE changed Bhavcopy column names in Jan 2024.
+New format uses: `TckrSymb`, `XpryDt`, `OptnTp`, `StrkPric`, `OpnIntrst` etc.
 
-            **Affected dates:** Usually 2024-01-01 onward (new NSE format).
-            **Fix:** Already handled — errors will reduce with next pipeline run.
+**Fix in 2 clicks:**
+1. Click **🔁 Retry Failed Dates** button (clears error status)
+2. Click **📥 Download Bhavcopy** again
+
+The updated `nyztrade_historical_gex.py` handles all NSE formats automatically.
+Make sure you uploaded the **latest** version to GitHub.
             """)
             err_rows = qry(
                 "SELECT trade_date, error_msg FROM download_log WHERE status='error' LIMIT 20")
             if err_rows:
-                import pandas as pd
                 st.dataframe(pd.DataFrame(err_rows, columns=['Date','Error']),
                              use_container_width=True, hide_index=True)
 
