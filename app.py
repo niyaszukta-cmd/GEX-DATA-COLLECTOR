@@ -125,8 +125,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state ────────────────────────────────────────────────────────────────
+# Always reset running=False on page load.
+# run_sync() is synchronous — if the page is loading, no pipeline is running.
+# This prevents the "stuck disabled buttons" bug after browser refresh.
+st.session_state['running'] = False
+
 for key, default in [
-    ('running', False), ('prog', 0.0), ('prog_msg', ''),
+    ('prog', 0.0), ('prog_msg', ''),
     ('error', ''), ('step_done', ''),
 ]:
     if key not in st.session_state:
@@ -258,6 +263,17 @@ with st.sidebar:
     st.caption("Safe to Ctrl-C and restart anytime.\nAll progress is preserved.")
 
     st.divider()
+    # Emergency reset — clears stuck "running" state
+    if st.button("🔄 Reset (if buttons stuck)", use_container_width=True,
+                 help="Click if buttons appear greyed out when nothing is running"):
+        st.session_state['running']  = False
+        st.session_state['prog']     = 0.0
+        st.session_state['prog_msg'] = ''
+        st.session_state['error']    = ''
+        st.session_state['step_done'] = ''
+        st.rerun()
+
+    st.divider()
     db = col.DB_PATH
     if db.exists():
         st.caption(f"DB: `{db}`  ({db.stat().st_size/1024**2:.1f} MB)")
@@ -357,7 +373,6 @@ with t1:
 
     st.divider()
     if st.button("🚀 Run Full Pipeline", type="primary",
-                 disabled=st.session_state['running'],
                  use_container_width=True):
         def _all(c):
             col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb)
@@ -393,12 +408,12 @@ with t2:
     ca, cb = st.columns(2)
     with ca:
         if st.button("📥 Download Bhavcopy", type="primary",
-                     disabled=st.session_state['running'], use_container_width=True):
+                     use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.BhavCopyDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
         if st.button("🔁 Retry Failed Dates",
-                     disabled=st.session_state['running'], use_container_width=True,
+                     use_container_width=True,
                      help="Clears 'error' status so failed dates are retried on next download"):
             c2 = col.init_db()
             c2.execute("DELETE FROM download_log WHERE status='error'")
@@ -471,13 +486,13 @@ with t3:
     ca, cb = st.columns(2)
     with ca:
         if st.button("📥 Download OHLCV", type="primary",
-                     disabled=st.session_state['running'], use_container_width=True):
+                     use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.OHLCVDownloader(c).download_range(start_d, end_d, prog_cb), _p, _t)
             st.rerun()
     with cb:
         if st.button("📐 Compute Returns from OHLCV",
-                     disabled=st.session_state['running'], use_container_width=True):
+                     use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
             st.rerun()
@@ -528,13 +543,13 @@ with t4:
     ca, cb = st.columns(2)
     with ca:
         if st.button("⚙️ Compute GEX (pending only)", type="primary",
-                     disabled=st.session_state['running'], use_container_width=True):
+                     use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.GEXEngine(c).compute_all(prog_cb), _p, _t)
             st.rerun()
     with cb:
         if st.button("📐 Step 4: Compute Returns",
-                     disabled=st.session_state['running'], use_container_width=True):
+                     use_container_width=True):
             _p = st.empty(); _t = st.empty()
             run_sync(lambda c: col.compute_returns(c, prog_cb), _p, _t)
             st.rerun()
@@ -592,7 +607,7 @@ with t5:
     st.divider()
 
     if st.button("📤 Generate All Export Files", type="primary",
-                 disabled=st.session_state['running'], use_container_width=False):
+                 use_container_width=False):
         _p = st.empty(); _t = st.empty()
         run_sync(lambda c: col.export_all(c, prog_cb), _p, _t)
         st.rerun()
